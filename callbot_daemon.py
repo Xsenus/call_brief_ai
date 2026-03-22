@@ -692,6 +692,48 @@ def run_openai_request(
         raise
 
 
+def verify_openai_route_before_processing(
+    cfg: Config,
+    openai_clients: OpenAIClients,
+) -> bool:
+    if not cfg.openai_proxy:
+        return True
+    if openai_proxy_route_is_in_cooldown(openai_clients):
+        return openai_clients.direct_fallback is not None
+
+    try:
+        run_openai_request(
+            openai_clients,
+            "route probe",
+            cfg,
+            lambda openai_client: openai_client.models.list(),
+        )
+        return True
+    except Exception as exc:
+        error_details = describe_processing_error(exc, cfg.openai_proxy)
+        is_proxy_probe_failure = (
+            bool(cfg.openai_proxy)
+            and error_details.get("provider") == "openai"
+            and error_details.get("code") in {
+                "proxy_error",
+                "connect_timeout",
+                "connection_error",
+                "timeout",
+            }
+        )
+        if is_proxy_probe_failure and openai_clients.proxy_enabled:
+            pause_openai_proxy_route(openai_clients, error_details)
+        if is_proxy_probe_failure and openai_clients.direct_fallback is None:
+            logging.warning(
+                "OpenAI route probe failed before file processing: %s",
+                error_details.get("message") or exc.__class__.__name__,
+            )
+            if error_details.get("hint"):
+                logging.error("%s", error_details["hint"])
+            return False
+        raise
+
+
 def setup_logging() -> None:
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -1985,6 +2027,11 @@ def scan_cycle(cfg: Config, client: OpenAIClients, state: Dict[str, Any]) -> Non
     audio_files.sort(key=lambda item: item["path"])
 
     logging.info("Cycle started. Found %s audio file(s).", len(audio_files))
+    if audio_files and not verify_openai_route_before_processing(cfg, client):
+        logging.warning(
+            "Skipping cycle before FTP downloads because the OpenAI route is unavailable."
+        )
+        return
     if (
         openai_proxy_route_is_in_cooldown(client)
         and client.direct_fallback is None

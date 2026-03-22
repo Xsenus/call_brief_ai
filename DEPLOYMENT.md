@@ -644,7 +644,7 @@ cat /opt/call_brief_ai/shared/.env
 
 Если после включения `OPENAI_PROXY` ошибка меняется на `httpx.ConnectTimeout`, `openai.APITimeoutError` или `CONNECT tunnel failed`, значит маршрут до proxy или сам proxy настроен неверно. Сначала добейтесь, чтобы `curl -x ... https://api.openai.com/v1/models ...` стабильно проходил с основного VPS, и только потом перезапускайте `callbot`.
 
-Новая версия daemon не будет бесконечно тратить цикл на мертвый proxy: после серии неудачных попыток маршрут через `OPENAI_PROXY` ставится на паузу на `OPENAI_PROXY_FAILURE_COOLDOWN_SEC`, а при включенном `OPENAI_PROXY_DIRECT_FALLBACK=1` сервис попробует временно использовать прямой маршрут.
+Новая версия daemon не будет бесконечно тратить цикл на мертвый proxy: перед скачиванием новых аудио она проверяет OpenAI-маршрут, после серии неудачных попыток ставит маршрут через `OPENAI_PROXY` на паузу на `OPENAI_PROXY_FAILURE_COOLDOWN_SEC`, а при включенном `OPENAI_PROXY_DIRECT_FALLBACK=1` сервис попробует временно использовать прямой маршрут.
 
 Запустите сервис вручную для диагностики:
 
