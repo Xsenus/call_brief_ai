@@ -155,6 +155,8 @@ nano /opt/call_brief_ai/shared/.env
 
 ```dotenv
 OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=
+OPENAI_PROXY=
 OPENAI_TRANSCRIBE_MODEL=gpt-4o-transcribe-diarize
 OPENAI_TRANSCRIBE_LANGUAGE=ru
 OPENAI_CHUNKING_STRATEGY=auto
@@ -188,6 +190,7 @@ WORK_ROOT=/opt/call_brief_ai/shared/work
 TELEGRAM_BOT_TOKEN=123456789:ABCDEF...
 TELEGRAM_CHAT_ID=-1001234567890
 TELEGRAM_MESSAGE_THREAD_ID=
+TELEGRAM_PROXY=
 
 POLL_INTERVAL_SEC=300
 MIN_STABLE_POLLS=2
@@ -203,11 +206,111 @@ MAX_API_FILE_SIZE_BYTES=26214400
 LOG_LEVEL=INFO
 ```
 
+### Если нужен proxy для OpenAI или Telegram
+
+Для OpenAI можно задать отдельный proxy:
+
+```dotenv
+OPENAI_PROXY=http://login:password@PROXY_HOST:8888
+```
+
+Для Telegram можно задать отдельный proxy:
+
+```dotenv
+TELEGRAM_PROXY=http://login:password@PROXY_HOST:8888
+```
+
+Если хотите проксировать весь HTTP(S)-трафик процесса целиком, вместо отдельных переменных можно использовать стандартные:
+
+```dotenv
+HTTP_PROXY=http://login:password@PROXY_HOST:8888
+HTTPS_PROXY=http://login:password@PROXY_HOST:8888
+NO_PROXY=127.0.0.1,localhost
+```
+
+Если используются `OPENAI_PROXY` и `TELEGRAM_PROXY`, глобальные `HTTP_PROXY` и `HTTPS_PROXY` обычно лучше не задавать, чтобы не было путаницы.
+
+Важно: proxy на том же VPS, где у вас уже возникает `403 unsupported_country_region_territory`, не поможет. Нужен отдельный VPS или gateway с выходным IP в поддерживаемой OpenAI стране.
+
 Сохранение в `nano`:
 
 1. `Ctrl+O`
 2. `Enter`
 3. `Ctrl+X`
+
+### Как поднять простой proxy на отдельном VPS
+
+Если OpenAI блокирует ваш основной сервер по региону, поднимайте proxy не на нем, а на отдельном VPS в поддерживаемой стране.
+
+Ниже пример с `tinyproxy` на отдельном сервере `PROXY_VPS_IP`.
+
+Установка:
+
+```bash
+apt-get update
+apt-get install -y tinyproxy
+cp /etc/tinyproxy/tinyproxy.conf /etc/tinyproxy/tinyproxy.conf.bak
+```
+
+Откройте конфиг:
+
+```bash
+nano /etc/tinyproxy/tinyproxy.conf
+```
+
+Минимальный рабочий пример:
+
+```conf
+User tinyproxy
+Group tinyproxy
+Port 8888
+Timeout 600
+LogLevel Info
+PidFile "/run/tinyproxy/tinyproxy.pid"
+MaxClients 100
+Allow 127.0.0.1
+Allow YOUR_APP_VPS_IP
+BasicAuth callbot StrongPassword123
+ConnectPort 443
+ConnectPort 80
+```
+
+Сохраните файл и перезапустите сервис:
+
+```bash
+systemctl enable tinyproxy
+systemctl restart tinyproxy
+systemctl status tinyproxy
+```
+
+Если включен firewall, откройте порт только для IP вашего основного VPS:
+
+```bash
+ufw allow from YOUR_APP_VPS_IP to any port 8888 proto tcp
+```
+
+Проверьте proxy с вашего основного VPS:
+
+```bash
+curl -x http://callbot:StrongPassword123@PROXY_VPS_IP:8888 \
+  https://api.openai.com/v1/models \
+  -H "Authorization: Bearer $OPENAI_API_KEY"
+```
+
+Если `curl` проходит, добавьте на основном VPS в `/opt/call_brief_ai/shared/.env`:
+
+```dotenv
+OPENAI_PROXY=http://callbot:StrongPassword123@PROXY_VPS_IP:8888
+```
+
+Потом перезапустите сервис:
+
+```bash
+sudo systemctl restart callbot.service
+journalctl -u callbot -f
+```
+
+Если в логине или пароле proxy есть специальные символы вроде `@`, `:`, `/`, их нужно URL-encode.
 
 ## 7. Как подготовить `instructions.json` на VPS
 
@@ -511,6 +614,8 @@ cat /opt/call_brief_ai/shared/.env
 ```
 
 ### Ошибка OpenAI / Telegram / FTP / SFTP
+
+Если ошибка OpenAI выглядит как `403 unsupported_country_region_territory`, проверьте `OPENAI_PROXY` или `OPENAI_BASE_URL`. Proxy должен находиться на отдельном VPS в поддерживаемой стране, а не на том же сервере, где уже возникает блокировка.
 
 Запустите сервис вручную для диагностики:
 

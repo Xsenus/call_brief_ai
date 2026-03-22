@@ -75,6 +75,9 @@ cp .env.example .env
 
 Важные настройки:
 
+- `OPENAI_BASE_URL` позволяет отправлять OpenAI-запросы в совместимый gateway вместо стандартного API.
+- `OPENAI_PROXY` задает отдельный HTTP/HTTPS proxy только для OpenAI.
+- `TELEGRAM_PROXY` задает отдельный HTTP/HTTPS proxy только для Telegram.
 - `FTP_PROTOCOL=sftp` для SFTP, `ftp` для FTP/FTPS.
 - `FTP_USE_TLS=1` актуален только для FTP/FTPS.
 - `FTP_ENCODING` задает кодировку FTP-листинга; для старых серверов с кириллицей часто нужен `cp1251`.
@@ -87,6 +90,30 @@ cp .env.example .env
 - `FTP_DELETE_AFTER_SUCCESS=1` удаляет исходный файл после успеха.
 
 Не включайте одновременно архивирование и удаление, если не уверены в сценарии. Обычно достаточно `FTP_MOVE_TO_ARCHIVE_AFTER_SUCCESS=1`.
+
+### Прокси
+
+Если нужно обойти региональные ограничения OpenAI, можно использовать отдельный proxy именно для OpenAI:
+
+```dotenv
+OPENAI_PROXY=http://login:password@PROXY_HOST:8888
+```
+
+Для Telegram можно задать свой proxy:
+
+```dotenv
+TELEGRAM_PROXY=http://login:password@PROXY_HOST:8888
+```
+
+Если вы хотите проксировать все HTTP(S)-запросы процесса целиком, вместо отдельных переменных можно использовать стандартные:
+
+```dotenv
+HTTP_PROXY=http://login:password@PROXY_HOST:8888
+HTTPS_PROXY=http://login:password@PROXY_HOST:8888
+NO_PROXY=127.0.0.1,localhost
+```
+
+Важно: proxy на том же VPS, где уже возникает `403 unsupported_country_region_territory`, проблему не решит. Выходной IP proxy должен быть в поддерживаемой OpenAI стране.
 
 ### 4. Подставьте актуальную инструкцию
 

@@ -18,10 +18,11 @@ from ftplib import FTP, FTP_TLS, all_errors, error_perm
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import httpx
 import paramiko
 import requests
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import APIStatusError, OpenAI, PermissionDeniedError
 
 
 load_dotenv()
@@ -131,6 +132,69 @@ def response_to_dict(obj: Any) -> Dict[str, Any]:
     raise TypeError(f"Unsupported response type: {type(obj)!r}")
 
 
+def build_requests_proxies(proxy_url: str) -> Optional[Dict[str, str]]:
+    proxy_url = (proxy_url or "").strip()
+    if not proxy_url:
+        return None
+    return {
+        "http": proxy_url,
+        "https": proxy_url,
+    }
+
+
+def describe_processing_error(exc: BaseException) -> Dict[str, Any]:
+    message = str(exc).strip() or exc.__class__.__name__
+    details: Dict[str, Any] = {
+        "class": exc.__class__.__name__,
+        "message": message,
+        "provider": None,
+        "status_code": None,
+        "code": None,
+        "type": None,
+        "param": None,
+        "hint": None,
+        "retryable": True,
+    }
+    if not isinstance(exc, APIStatusError):
+        return details
+
+    details["provider"] = "openai"
+    details["status_code"] = getattr(exc, "status_code", None)
+    code = getattr(exc, "code", None)
+    param = getattr(exc, "param", None)
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error_payload = body.get("error")
+        if isinstance(error_payload, dict):
+            code = error_payload.get("code") or code
+            param = error_payload.get("param") or param
+            error_type = error_payload.get("type")
+            if error_type:
+                details["type"] = str(error_type).strip() or None
+            provider_message = error_payload.get("message")
+            if provider_message:
+                details["message"] = str(provider_message).strip()
+
+    if code:
+        details["code"] = str(code).strip() or None
+    if param:
+        details["param"] = str(param).strip() or None
+
+    if (
+        isinstance(exc, PermissionDeniedError)
+        and (details["code"] or "").lower() == "unsupported_country_region_territory"
+    ):
+        details["retryable"] = False
+        details["hint"] = (
+            "OpenAI rejected the request because this server's outbound IP is in an "
+            "unsupported country, region, or territory. Move the daemon to a supported "
+            "region, route OpenAI traffic through supported-region egress with "
+            "OPENAI_PROXY, or set OPENAI_BASE_URL if you use a compatible gateway."
+        )
+
+    return details
+
+
 def count_words(text: str) -> int:
     return len(re.findall(r"\w+", text or "", flags=re.UNICODE))
 
@@ -153,6 +217,8 @@ class Config:
     ftp_connect_attempts: int
     ftp_retry_delay_sec: float
     openai_api_key: str
+    openai_base_url: str
+    openai_proxy: str
     transcribe_model: str
     transcribe_language: str
     transcribe_chunking_strategy: str
@@ -166,6 +232,7 @@ class Config:
     telegram_bot_token: str
     telegram_chat_id: str
     telegram_message_thread_id: Optional[int]
+    telegram_proxy: str
     poll_interval_sec: int
     min_stable_polls: int
     min_audio_bytes: int
@@ -222,6 +289,8 @@ class Config:
                 0.0, float(os.getenv("FTP_RETRY_DELAY_SEC", "5"))
             ),
             openai_api_key=os.environ["OPENAI_API_KEY"],
+            openai_base_url=os.getenv("OPENAI_BASE_URL", "").strip(),
+            openai_proxy=os.getenv("OPENAI_PROXY", "").strip(),
             transcribe_model=os.getenv(
                 "OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe-diarize"
             ).strip(),
@@ -254,6 +323,7 @@ class Config:
             telegram_bot_token=os.environ["TELEGRAM_BOT_TOKEN"],
             telegram_chat_id=os.environ["TELEGRAM_CHAT_ID"],
             telegram_message_thread_id=env_optional_int("TELEGRAM_MESSAGE_THREAD_ID"),
+            telegram_proxy=os.getenv("TELEGRAM_PROXY", "").strip(),
             poll_interval_sec=int(os.getenv("POLL_INTERVAL_SEC", "300")),
             min_stable_polls=int(os.getenv("MIN_STABLE_POLLS", "2")),
             min_audio_bytes=int(os.getenv("MIN_AUDIO_BYTES", str(100 * 1024))),
@@ -1048,6 +1118,32 @@ def build_skip_document(
     }
 
 
+def build_error_document(
+    remote_file: Dict[str, Any],
+    error_details: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "generated_at": now_iso(),
+        "stage": "error",
+        "status": "error",
+        "error": error_details,
+        "source": {
+            "ftp_path_audio": remote_file["path"],
+            "file_name_audio": remote_file["name"],
+            "file_size_bytes": remote_file["size"],
+            "ftp_modify": remote_file.get("modify"),
+            "file_metadata": parse_filename_metadata(remote_file["name"]),
+        },
+        "transcription": None,
+        "analysis": None,
+        "telegram": {
+            "sent": False,
+            "reason": "processing failed",
+            "updated_at": now_iso(),
+        },
+    }
+
+
 def transcribe_part(client: OpenAI, audio_path: Path, cfg: Config) -> Dict[str, Any]:
     with audio_path.open("rb") as audio_file:
         transcription = client.audio.transcriptions.create(
@@ -1236,6 +1332,7 @@ def send_telegram_message(cfg: Config, text: str) -> List[Dict[str, Any]]:
     url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage"
     pieces = split_text_for_telegram(text)
     results: List[Dict[str, Any]] = []
+    proxies = build_requests_proxies(cfg.telegram_proxy)
 
     for index, piece in enumerate(pieces, start=1):
         payload: Dict[str, Any] = {
@@ -1245,7 +1342,7 @@ def send_telegram_message(cfg: Config, text: str) -> List[Dict[str, Any]]:
         }
         if cfg.telegram_message_thread_id is not None:
             payload["message_thread_id"] = cfg.telegram_message_thread_id
-        response = requests.post(url, json=payload, timeout=60)
+        response = requests.post(url, json=payload, timeout=60, proxies=proxies)
         response.raise_for_status()
         data = response.json()
         if not data.get("ok"):
@@ -1268,6 +1365,8 @@ def process_remote_audio(
     entry["stage"] = "processing"
     entry["last_started_at"] = now_iso()
     entry["last_error"] = None
+    entry["last_error_code"] = None
+    entry["last_error_hint"] = None
     entry["skip_reason"] = None
     save_state(cfg.state_path, state)
 
@@ -1387,18 +1486,29 @@ def process_remote_audio(
                 )
             logging.info("Done: %s", remote_audio_path)
     except Exception as exc:
+        error_details = describe_processing_error(exc)
         logging.exception("Processing failed for %s", remote_audio_path)
+        if error_details.get("hint"):
+            logging.error("%s", error_details["hint"])
         entry["stage"] = "error"
-        entry["last_error"] = str(exc)
+        entry["last_error"] = error_details["message"]
+        entry["last_error_code"] = error_details.get("code")
+        entry["last_error_hint"] = error_details.get("hint")
         entry["last_failed_at"] = now_iso()
         save_state(cfg.state_path, state)
-        if transcript_doc is not None:
-            transcript_doc["stage"] = "error"
-            transcript_doc["error"] = str(exc)
-            try:
-                remote_upload_json(cfg, remote_json_path, transcript_doc)
-            except Exception:
-                logging.exception("Could not upload error JSON for %s", remote_audio_path)
+        error_doc = transcript_doc or build_error_document(remote_file, error_details)
+        error_doc["stage"] = "error"
+        error_doc["error"] = error_details
+        if error_doc.get("telegram") is None:
+            error_doc["telegram"] = {
+                "sent": False,
+                "reason": "processing failed",
+                "updated_at": now_iso(),
+            }
+        try:
+            remote_upload_json(cfg, remote_json_path, error_doc)
+        except Exception:
+            logging.exception("Could not upload error JSON for %s", remote_audio_path)
 
 
 def should_process_file(
@@ -1529,7 +1639,19 @@ def main() -> None:
             f"instructions file not found: {cfg.instruction_json_path}"
         )
 
-    client = OpenAI(api_key=cfg.openai_api_key)
+    client_kwargs: Dict[str, Any] = {"api_key": cfg.openai_api_key}
+    if cfg.openai_base_url:
+        client_kwargs["base_url"] = cfg.openai_base_url
+        logging.info("Using custom OpenAI base URL: %s", cfg.openai_base_url)
+    if cfg.openai_proxy:
+        client_kwargs["http_client"] = httpx.Client(
+            proxy=cfg.openai_proxy,
+            trust_env=True,
+        )
+        logging.info("Using dedicated OpenAI proxy from OPENAI_PROXY.")
+    if cfg.telegram_proxy:
+        logging.info("Using dedicated Telegram proxy from TELEGRAM_PROXY.")
+    client = OpenAI(**client_kwargs)
     state = load_state(cfg.state_path)
 
     logging.info(
