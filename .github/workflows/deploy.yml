@@ -40,6 +40,7 @@ jobs:
 
       - name: Build release archive
         run: |
+          ARCHIVE_PATH="${RUNNER_TEMP}/release.tar.gz"
           tar \
             --exclude-vcs \
             --exclude='.github' \
@@ -49,7 +50,8 @@ jobs:
             --exclude='.env' \
             --exclude='work' \
             --exclude='state.json' \
-            -czf release.tar.gz .
+            -czf "${ARCHIVE_PATH}" .
+          echo "RELEASE_ARCHIVE=${ARCHIVE_PATH}" >> "$GITHUB_ENV"
 
       - name: Configure SSH
         env:
@@ -68,7 +70,8 @@ jobs:
           VPS_PORT: ${{ secrets.VPS_PORT }}
           VPS_USER: ${{ secrets.VPS_USER }}
         run: |
-          scp -P "${VPS_PORT:-22}" release.tar.gz deploy/remote_deploy.sh deploy/callbot.service "${VPS_USER}@${VPS_HOST}:/tmp/"
+          scp -P "${VPS_PORT:-22}" "${RELEASE_ARCHIVE}" "${VPS_USER}@${VPS_HOST}:/tmp/release.tar.gz"
+          scp -P "${VPS_PORT:-22}" deploy/remote_deploy.sh deploy/callbot.service "${VPS_USER}@${VPS_HOST}:/tmp/"
 
       - name: Run remote deployment
         env:
