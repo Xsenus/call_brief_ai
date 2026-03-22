@@ -120,6 +120,8 @@ class Config:
     ftp_move_to_archive_after_success: bool
     ftp_use_tls: bool
     ftp_timeout_sec: int
+    ftp_connect_attempts: int
+    ftp_retry_delay_sec: float
     openai_api_key: str
     transcribe_model: str
     transcribe_language: str
@@ -178,6 +180,12 @@ class Config:
             ),
             ftp_use_tls=env_bool("FTP_USE_TLS", True),
             ftp_timeout_sec=int(os.getenv("FTP_TIMEOUT_SEC", "60")),
+            ftp_connect_attempts=max(
+                1, int(os.getenv("FTP_CONNECT_ATTEMPTS", "2"))
+            ),
+            ftp_retry_delay_sec=max(
+                0.0, float(os.getenv("FTP_RETRY_DELAY_SEC", "5"))
+            ),
             openai_api_key=os.environ["OPENAI_API_KEY"],
             transcribe_model=os.getenv(
                 "OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe-diarize"
@@ -283,7 +291,65 @@ def load_instruction_text(path: Path) -> str:
     return raw.strip()
 
 
-def ftp_connect(cfg: Config):
+class RemoteConnectionError(RuntimeError):
+    pass
+
+
+def is_retryable_remote_error(exc: Exception) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    if isinstance(exc, EOFError):
+        return True
+    if isinstance(exc, paramiko.SSHException):
+        message = str(exc).lower()
+        return "timeout" in message or "banner" in message
+    if isinstance(exc, OSError):
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "timed out",
+                "timeout",
+                "temporarily unavailable",
+                "connection reset",
+                "connection aborted",
+                "connection refused",
+                "network is unreachable",
+                "broken pipe",
+            )
+        )
+    return False
+
+
+def connect_with_retry(cfg: Config, protocol: str, fn):
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, cfg.ftp_connect_attempts + 1):
+        try:
+            return fn()
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            if not is_retryable_remote_error(exc):
+                raise
+            last_exc = exc
+            if attempt >= cfg.ftp_connect_attempts:
+                break
+            logging.warning(
+                "%s connection attempt %s/%s failed: %s. Retrying in %.1f sec.",
+                protocol.upper(),
+                attempt,
+                cfg.ftp_connect_attempts,
+                exc,
+                cfg.ftp_retry_delay_sec,
+            )
+            time.sleep(cfg.ftp_retry_delay_sec)
+    raise RemoteConnectionError(
+        f"{protocol.upper()} connection to {cfg.ftp_host}:{cfg.ftp_port} "
+        f"failed after {cfg.ftp_connect_attempts} attempt(s): {last_exc}"
+    ) from last_exc
+
+
+def ftp_connect_once(cfg: Config):
     ftp = FTP_TLS() if cfg.ftp_use_tls else FTP()
     ftp.encoding = "utf-8"
     ftp.connect(cfg.ftp_host, cfg.ftp_port, timeout=cfg.ftp_timeout_sec)
@@ -291,6 +357,10 @@ def ftp_connect(cfg: Config):
     if cfg.ftp_use_tls and isinstance(ftp, FTP_TLS):
         ftp.prot_p()
     return ftp
+
+
+def ftp_connect(cfg: Config):
+    return connect_with_retry(cfg, "ftp", lambda: ftp_connect_once(cfg))
 
 
 def ftp_download_file(cfg: Config, remote_path: str, local_path: Path) -> None:
@@ -324,13 +394,21 @@ def ensure_ftp_dir(ftp, directory: str) -> None:
             ftp.mkd(current)
 
 
-def sftp_connect(cfg: Config):
+def sftp_connect_once(cfg: Config):
     transport = paramiko.Transport((cfg.ftp_host, cfg.ftp_port))
     transport.banner_timeout = cfg.ftp_timeout_sec
     transport.auth_timeout = cfg.ftp_timeout_sec
-    transport.connect(username=cfg.ftp_user, password=cfg.ftp_password)
-    sftp = paramiko.SFTPClient.from_transport(transport)
-    return transport, sftp
+    try:
+        transport.connect(username=cfg.ftp_user, password=cfg.ftp_password)
+        sftp = paramiko.SFTPClient.from_transport(transport)
+        return transport, sftp
+    except Exception:
+        transport.close()
+        raise
+
+
+def sftp_connect(cfg: Config):
+    return connect_with_retry(cfg, "sftp", lambda: sftp_connect_once(cfg))
 
 
 def ensure_sftp_dir(sftp: paramiko.SFTPClient, directory: str) -> None:
@@ -1312,7 +1390,11 @@ def should_process_file(
 
 def scan_cycle(cfg: Config, client: OpenAI, state: Dict[str, Any]) -> None:
     instruction_text = load_instruction_text(cfg.instruction_json_path)
-    all_files = remote_walk(cfg)
+    try:
+        all_files = remote_walk(cfg)
+    except RemoteConnectionError as exc:
+        logging.warning("Remote scan skipped: %s", exc)
+        return
 
     remote_files_by_path = {item["path"]: item for item in all_files}
     audio_files = [
@@ -1341,6 +1423,11 @@ def main() -> None:
 
     if cfg.ftp_protocol not in {"ftp", "sftp"}:
         raise ValueError("FTP_PROTOCOL must be either 'ftp' or 'sftp'")
+    if cfg.ftp_protocol == "ftp" and cfg.ftp_port == 22:
+        raise ValueError(
+            "FTP_PROTOCOL=ftp with FTP_PORT=22 is likely a misconfiguration. "
+            "Use FTP_PROTOCOL=sftp for port 22, or switch FTP_PORT to your FTP/FTPS port."
+        )
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is required but was not found in PATH")
     if shutil.which("ffprobe") is None:
