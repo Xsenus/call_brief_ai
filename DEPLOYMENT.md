@@ -221,7 +221,21 @@ OPENAI_PROXY=http://login:password@PROXY_HOST:8888
 ```dotenv
 OPENAI_TIMEOUT_SEC=600
 OPENAI_CONNECT_TIMEOUT_SEC=30
+OPENAI_REQUEST_ATTEMPTS=2
+OPENAI_RETRY_DELAY_SEC=2
+OPENAI_RETRY_BACKOFF=2
+OPENAI_PROXY_FAILURE_COOLDOWN_SEC=300
 ```
+
+Если proxy иногда падает целиком, daemon теперь может быстро прекратить безрезультатные попытки через этот маршрут на время `OPENAI_PROXY_FAILURE_COOLDOWN_SEC`, чтобы не тратить весь цикл на один и тот же `ConnectTimeout`.
+
+Опционально можно разрешить прямой fallback без proxy:
+
+```dotenv
+OPENAI_PROXY_DIRECT_FALLBACK=1
+```
+
+Включайте это только если ваш основной VPS сам может обращаться к OpenAI напрямую и такой обход допустим по региону и сети.
 
 Для Telegram можно задать отдельный proxy:
 
@@ -629,6 +643,8 @@ cat /opt/call_brief_ai/shared/.env
 Если ошибка OpenAI выглядит как `403 unsupported_country_region_territory`, проверьте `OPENAI_PROXY` или `OPENAI_BASE_URL`. Proxy должен находиться на отдельном VPS в поддерживаемой стране, а не на том же сервере, где уже возникает блокировка.
 
 Если после включения `OPENAI_PROXY` ошибка меняется на `httpx.ConnectTimeout`, `openai.APITimeoutError` или `CONNECT tunnel failed`, значит маршрут до proxy или сам proxy настроен неверно. Сначала добейтесь, чтобы `curl -x ... https://api.openai.com/v1/models ...` стабильно проходил с основного VPS, и только потом перезапускайте `callbot`.
+
+Новая версия daemon не будет бесконечно тратить цикл на мертвый proxy: после серии неудачных попыток маршрут через `OPENAI_PROXY` ставится на паузу на `OPENAI_PROXY_FAILURE_COOLDOWN_SEC`, а при включенном `OPENAI_PROXY_DIRECT_FALLBACK=1` сервис попробует временно использовать прямой маршрут.
 
 Запустите сервис вручную для диагностики:
 

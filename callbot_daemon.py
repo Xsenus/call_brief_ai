@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from ftplib import FTP, FTP_TLS, all_errors, error_perm
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 import httpx
 import paramiko
@@ -49,6 +49,11 @@ TELEGRAM_TEXT_LIMIT = 3900
 DEFAULT_TRANSCRIBE_MAX_BYTES = 25 * 1024 * 1024
 DEFAULT_OPENAI_TIMEOUT_SEC = 600.0
 DEFAULT_OPENAI_CONNECT_TIMEOUT_SEC = 30.0
+DEFAULT_OPENAI_REQUEST_ATTEMPTS = 2
+DEFAULT_OPENAI_RETRY_DELAY_SEC = 2.0
+DEFAULT_OPENAI_RETRY_BACKOFF = 2.0
+DEFAULT_OPENAI_PROXY_FAILURE_COOLDOWN_SEC = 300.0
+T = TypeVar("T")
 
 
 class ReusedSessionFTP_TLS(FTP_TLS):
@@ -295,6 +300,11 @@ class Config:
     openai_proxy: str
     openai_timeout_sec: float
     openai_connect_timeout_sec: float
+    openai_request_attempts: int
+    openai_retry_delay_sec: float
+    openai_retry_backoff: float
+    openai_proxy_failure_cooldown_sec: float
+    openai_proxy_direct_fallback: bool
     transcribe_model: str
     transcribe_language: str
     transcribe_chunking_strategy: str
@@ -385,6 +395,46 @@ class Config:
                     )
                 ),
             ),
+            openai_request_attempts=max(
+                1,
+                int(
+                    os.getenv(
+                        "OPENAI_REQUEST_ATTEMPTS",
+                        str(DEFAULT_OPENAI_REQUEST_ATTEMPTS),
+                    )
+                ),
+            ),
+            openai_retry_delay_sec=max(
+                0.0,
+                float(
+                    os.getenv(
+                        "OPENAI_RETRY_DELAY_SEC",
+                        str(DEFAULT_OPENAI_RETRY_DELAY_SEC),
+                    )
+                ),
+            ),
+            openai_retry_backoff=max(
+                1.0,
+                float(
+                    os.getenv(
+                        "OPENAI_RETRY_BACKOFF",
+                        str(DEFAULT_OPENAI_RETRY_BACKOFF),
+                    )
+                ),
+            ),
+            openai_proxy_failure_cooldown_sec=max(
+                1.0,
+                float(
+                    os.getenv(
+                        "OPENAI_PROXY_FAILURE_COOLDOWN_SEC",
+                        str(DEFAULT_OPENAI_PROXY_FAILURE_COOLDOWN_SEC),
+                    )
+                ),
+            ),
+            openai_proxy_direct_fallback=env_bool(
+                "OPENAI_PROXY_DIRECT_FALLBACK",
+                False,
+            ),
             transcribe_model=os.getenv(
                 "OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe-diarize"
             ).strip(),
@@ -439,6 +489,207 @@ class Config:
                 )
             ),
         )
+
+
+@dataclass
+class OpenAIClients:
+    primary: OpenAI
+    direct_fallback: Optional[OpenAI]
+    proxy_enabled: bool
+    proxy_failure_cooldown_sec: float
+    proxy_unavailable_until: float = 0.0
+
+
+def build_openai_timeout(cfg: Config) -> httpx.Timeout:
+    return httpx.Timeout(
+        cfg.openai_timeout_sec,
+        connect=cfg.openai_connect_timeout_sec,
+    )
+
+
+def build_openai_client_kwargs(
+    cfg: Config,
+    http_client: Optional[httpx.Client] = None,
+) -> Dict[str, Any]:
+    client_kwargs: Dict[str, Any] = {
+        "api_key": cfg.openai_api_key,
+        "max_retries": 0,
+    }
+    if cfg.openai_base_url:
+        client_kwargs["base_url"] = cfg.openai_base_url
+    if http_client is not None:
+        client_kwargs["http_client"] = http_client
+    else:
+        client_kwargs["timeout"] = build_openai_timeout(cfg)
+    return client_kwargs
+
+
+def build_openai_clients(cfg: Config) -> Tuple[OpenAIClients, List[httpx.Client]]:
+    http_clients: List[httpx.Client] = []
+
+    primary_http_client: Optional[httpx.Client] = None
+    if cfg.openai_proxy:
+        primary_http_client = build_openai_http_client(
+            cfg,
+            proxy_url=cfg.openai_proxy,
+            trust_env=False,
+        )
+        http_clients.append(primary_http_client)
+    primary = OpenAI(**build_openai_client_kwargs(cfg, primary_http_client))
+
+    direct_fallback: Optional[OpenAI] = None
+    if cfg.openai_proxy and cfg.openai_proxy_direct_fallback:
+        direct_http_client = build_openai_http_client(cfg, trust_env=False)
+        http_clients.append(direct_http_client)
+        direct_fallback = OpenAI(
+            **build_openai_client_kwargs(cfg, direct_http_client)
+        )
+
+    return (
+        OpenAIClients(
+            primary=primary,
+            direct_fallback=direct_fallback,
+            proxy_enabled=bool(cfg.openai_proxy),
+            proxy_failure_cooldown_sec=cfg.openai_proxy_failure_cooldown_sec,
+        ),
+        http_clients,
+    )
+
+
+def is_retryable_openai_error(
+    exc: BaseException,
+    details: Dict[str, Any],
+) -> bool:
+    if details.get("provider") != "openai" or not details.get("retryable", True):
+        return False
+    if isinstance(exc, APIStatusError):
+        status_code = details.get("status_code")
+        if isinstance(status_code, int):
+            return status_code in {408, 409, 429} or status_code >= 500
+        return False
+    return details.get("code") in {
+        "proxy_error",
+        "connect_timeout",
+        "timeout",
+        "connection_error",
+    }
+
+
+def is_openai_proxy_route_error(cfg: Config, details: Dict[str, Any]) -> bool:
+    return bool(cfg.openai_proxy) and details.get("provider") == "openai" and details.get(
+        "code"
+    ) in {
+        "proxy_error",
+        "connect_timeout",
+        "connection_error",
+    }
+
+
+def openai_retry_delay_sec(cfg: Config, attempt: int) -> float:
+    return cfg.openai_retry_delay_sec * (cfg.openai_retry_backoff ** max(0, attempt - 1))
+
+
+def openai_proxy_route_cooldown_remaining_sec(openai_clients: OpenAIClients) -> float:
+    return max(0.0, openai_clients.proxy_unavailable_until - time.monotonic())
+
+
+def openai_proxy_route_is_in_cooldown(openai_clients: OpenAIClients) -> bool:
+    return openai_proxy_route_cooldown_remaining_sec(openai_clients) > 0.0
+
+
+def pause_openai_proxy_route(
+    openai_clients: OpenAIClients,
+    error_details: Dict[str, Any],
+) -> None:
+    now = time.monotonic()
+    openai_clients.proxy_unavailable_until = max(
+        openai_clients.proxy_unavailable_until,
+        now + openai_clients.proxy_failure_cooldown_sec,
+    )
+    logging.warning(
+        "OpenAI proxy route paused for %.0f sec after connectivity failure: %s",
+        openai_proxy_route_cooldown_remaining_sec(openai_clients),
+        error_details.get("message") or "OpenAI proxy route failure",
+    )
+
+
+def execute_openai_request(
+    client: OpenAI,
+    operation: str,
+    cfg: Config,
+    describe_proxy_errors_with: str,
+    fn: Callable[[OpenAI], T],
+) -> T:
+    for attempt in range(1, cfg.openai_request_attempts + 1):
+        try:
+            return fn(client)
+        except Exception as exc:
+            error_details = describe_processing_error(
+                exc,
+                describe_proxy_errors_with,
+            )
+            if (
+                not is_retryable_openai_error(exc, error_details)
+                or attempt >= cfg.openai_request_attempts
+            ):
+                raise
+            delay_sec = openai_retry_delay_sec(cfg, attempt)
+            logging.warning(
+                "OpenAI %s attempt %s/%s failed: %s. Retrying in %.1f sec.",
+                operation,
+                attempt,
+                cfg.openai_request_attempts,
+                error_details.get("message") or exc.__class__.__name__,
+                delay_sec,
+            )
+            if delay_sec > 0:
+                time.sleep(delay_sec)
+    raise RuntimeError(f"OpenAI {operation} failed without raising an exception")
+
+
+def run_openai_request(
+    openai_clients: OpenAIClients,
+    operation: str,
+    cfg: Config,
+    fn: Callable[[OpenAI], T],
+) -> T:
+    if openai_proxy_route_is_in_cooldown(openai_clients) and openai_clients.direct_fallback:
+        return execute_openai_request(
+            openai_clients.direct_fallback,
+            operation,
+            cfg,
+            "",
+            fn,
+        )
+
+    try:
+        return execute_openai_request(
+            openai_clients.primary,
+            operation,
+            cfg,
+            cfg.openai_proxy,
+            fn,
+        )
+    except Exception as exc:
+        error_details = describe_processing_error(exc, cfg.openai_proxy)
+        if (
+            is_openai_proxy_route_error(cfg, error_details)
+            and openai_clients.proxy_enabled
+        ):
+            pause_openai_proxy_route(openai_clients, error_details)
+            if openai_clients.direct_fallback:
+                logging.warning(
+                    "Falling back to direct OpenAI route for %s after proxy failure.",
+                    operation,
+                )
+                return execute_openai_request(
+                    openai_clients.direct_fallback,
+                    operation,
+                    cfg,
+                    "",
+                    fn,
+                )
+        raise
 
 
 def setup_logging() -> None:
@@ -1238,14 +1489,23 @@ def build_error_document(
     }
 
 
-def transcribe_part(client: OpenAI, audio_path: Path, cfg: Config) -> Dict[str, Any]:
+def transcribe_part(client: OpenAIClients, audio_path: Path, cfg: Config) -> Dict[str, Any]:
     with audio_path.open("rb") as audio_file:
-        transcription = client.audio.transcriptions.create(
-            file=audio_file,
-            model=cfg.transcribe_model,
-            language=cfg.transcribe_language,
-            response_format="diarized_json",
-            chunking_strategy=cfg.transcribe_chunking_strategy,
+        def create_transcription(openai_client: OpenAI):
+            audio_file.seek(0)
+            return openai_client.audio.transcriptions.create(
+                file=audio_file,
+                model=cfg.transcribe_model,
+                language=cfg.transcribe_language,
+                response_format="diarized_json",
+                chunking_strategy=cfg.transcribe_chunking_strategy,
+            )
+
+        transcription = run_openai_request(
+            client,
+            f"transcription for {audio_path.name}",
+            cfg,
+            create_transcription,
         )
 
     data = response_to_dict(transcription)
@@ -1347,7 +1607,7 @@ def extract_response_text(response: Any) -> str:
 
 
 def analyze_transcript(
-    client: OpenAI,
+    client: OpenAIClients,
     instruction_text: str,
     transcript_doc: Dict[str, Any],
     cfg: Config,
@@ -1391,7 +1651,12 @@ def analyze_transcript(
     if cfg.analysis_reasoning_effort:
         request["reasoning"] = {"effort": cfg.analysis_reasoning_effort}
 
-    response = client.responses.create(**request)
+    response = run_openai_request(
+        client,
+        "analysis request",
+        cfg,
+        lambda openai_client: openai_client.responses.create(**request),
+    )
     text = extract_response_text(response)
     if not text:
         raise RuntimeError("OpenAI analysis returned an empty message")
@@ -1446,23 +1711,23 @@ def send_telegram_message(cfg: Config, text: str) -> List[Dict[str, Any]]:
     return results
 
 
-def build_openai_http_client(cfg: Config) -> Optional[httpx.Client]:
-    if not cfg.openai_proxy:
-        return None
-    timeout = httpx.Timeout(
-        cfg.openai_timeout_sec,
-        connect=cfg.openai_connect_timeout_sec,
-    )
-    return httpx.Client(
-        proxy=cfg.openai_proxy,
-        timeout=timeout,
-        trust_env=False,
-    )
+def build_openai_http_client(
+    cfg: Config,
+    proxy_url: str = "",
+    trust_env: bool = True,
+) -> httpx.Client:
+    client_kwargs: Dict[str, Any] = {
+        "timeout": build_openai_timeout(cfg),
+        "trust_env": trust_env,
+    }
+    if proxy_url:
+        client_kwargs["proxy"] = proxy_url
+    return httpx.Client(**client_kwargs)
 
 
 def process_remote_audio(
     cfg: Config,
-    client: OpenAI,
+    client: OpenAIClients,
     instruction_text: str,
     state: Dict[str, Any],
     remote_file: Dict[str, Any],
@@ -1594,7 +1859,12 @@ def process_remote_audio(
                 )
             logging.info("Done: %s", remote_audio_path)
     except Exception as exc:
-        error_details = describe_processing_error(exc, cfg.openai_proxy)
+        error_details = describe_processing_error(
+            exc,
+            ""
+            if openai_proxy_route_is_in_cooldown(client) and client.direct_fallback
+            else cfg.openai_proxy,
+        )
         logging.exception("Processing failed for %s", remote_audio_path)
         if error_details.get("hint"):
             logging.error("%s", error_details["hint"])
@@ -1698,7 +1968,7 @@ def should_process_file(
     return True
 
 
-def scan_cycle(cfg: Config, client: OpenAI, state: Dict[str, Any]) -> None:
+def scan_cycle(cfg: Config, client: OpenAIClients, state: Dict[str, Any]) -> None:
     instruction_text = load_instruction_text(cfg.instruction_json_path)
     try:
         all_files = remote_walk(cfg)
@@ -1715,7 +1985,25 @@ def scan_cycle(cfg: Config, client: OpenAI, state: Dict[str, Any]) -> None:
     audio_files.sort(key=lambda item: item["path"])
 
     logging.info("Cycle started. Found %s audio file(s).", len(audio_files))
+    if (
+        openai_proxy_route_is_in_cooldown(client)
+        and client.direct_fallback is None
+    ):
+        logging.warning(
+            "Skipping cycle because OpenAI proxy route is paused for %.0f more sec.",
+            openai_proxy_route_cooldown_remaining_sec(client),
+        )
+        return
     for remote_file in audio_files:
+        if (
+            openai_proxy_route_is_in_cooldown(client)
+            and client.direct_fallback is None
+        ):
+            logging.warning(
+                "Stopping cycle early because OpenAI proxy route is paused for %.0f more sec.",
+                openai_proxy_route_cooldown_remaining_sec(client),
+            )
+            break
         if should_process_file(remote_file, remote_files_by_path, state, cfg):
             save_state(cfg.state_path, state)
             process_remote_audio(cfg, client, instruction_text, state, remote_file)
@@ -1727,7 +2015,7 @@ def scan_cycle(cfg: Config, client: OpenAI, state: Dict[str, Any]) -> None:
 def main() -> None:
     setup_logging()
     cfg = Config.from_env()
-    openai_http_client: Optional[httpx.Client] = None
+    openai_http_clients: List[httpx.Client] = []
 
     cfg.work_root.mkdir(parents=True, exist_ok=True)
     ensure_parent_dir(cfg.state_path)
@@ -1748,23 +2036,34 @@ def main() -> None:
             f"instructions file not found: {cfg.instruction_json_path}"
         )
 
-    client_kwargs: Dict[str, Any] = {"api_key": cfg.openai_api_key}
     if cfg.openai_base_url:
-        client_kwargs["base_url"] = cfg.openai_base_url
         logging.info("Using custom OpenAI base URL: %s", cfg.openai_base_url)
     if cfg.openai_proxy:
-        openai_http_client = build_openai_http_client(cfg)
-        client_kwargs["http_client"] = openai_http_client
         logging.info(
             "Using dedicated OpenAI proxy from OPENAI_PROXY "
             "(connect timeout: %.1f sec, overall timeout: %.1f sec).",
             cfg.openai_connect_timeout_sec,
             cfg.openai_timeout_sec,
         )
+        logging.info(
+            "OpenAI proxy failures will pause the proxy route for %.0f sec.",
+            cfg.openai_proxy_failure_cooldown_sec,
+        )
+    logging.info(
+        "OpenAI request policy: %s attempt(s), retry delay %.1f sec, backoff %.1f.",
+        cfg.openai_request_attempts,
+        cfg.openai_retry_delay_sec,
+        cfg.openai_retry_backoff,
+    )
+    if cfg.openai_proxy_direct_fallback:
+        logging.warning(
+            "OPENAI_PROXY_DIRECT_FALLBACK is enabled. If the proxy route fails, "
+            "the daemon will temporarily send OpenAI traffic directly from this VPS."
+        )
     if cfg.telegram_proxy:
         logging.info("Using dedicated Telegram proxy from TELEGRAM_PROXY.")
     try:
-        client = OpenAI(**client_kwargs)
+        client, openai_http_clients = build_openai_clients(cfg)
         state = load_state(cfg.state_path)
 
         logging.info(
@@ -1782,8 +2081,8 @@ def main() -> None:
                 logging.exception("Cycle crashed")
             time.sleep(cfg.poll_interval_sec)
     finally:
-        if openai_http_client is not None:
-            openai_http_client.close()
+        for http_client in openai_http_clients:
+            http_client.close()
 
 
 if __name__ == "__main__":

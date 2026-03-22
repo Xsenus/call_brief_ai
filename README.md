@@ -79,6 +79,9 @@ cp .env.example .env
 - `OPENAI_PROXY` задает отдельный HTTP/HTTPS proxy только для OpenAI.
 - `OPENAI_TIMEOUT_SEC=600` задает общий timeout OpenAI-запроса.
 - `OPENAI_CONNECT_TIMEOUT_SEC=30` увеличивает timeout на подключение к proxy/OpenAI, что особенно полезно при `OPENAI_PROXY`.
+- `OPENAI_REQUEST_ATTEMPTS=2`, `OPENAI_RETRY_DELAY_SEC=2` и `OPENAI_RETRY_BACKOFF=2` управляют повтором OpenAI-запросов при временных сетевых сбоях.
+- `OPENAI_PROXY_FAILURE_COOLDOWN_SEC=300` временно останавливает попытки через умерший `OPENAI_PROXY`, чтобы сервис не тратил весь цикл на одинаковые таймауты.
+- `OPENAI_PROXY_DIRECT_FALLBACK=1` разрешает временно уйти на прямой маршрут без proxy, но включайте это только если сам VPS может ходить в OpenAI напрямую и это допустимо по региону.
 - `TELEGRAM_PROXY` задает отдельный HTTP/HTTPS proxy только для Telegram.
 - `FTP_PROTOCOL=sftp` для SFTP, `ftp` для FTP/FTPS.
 - `FTP_USE_TLS=1` актуален только для FTP/FTPS.
@@ -118,6 +121,8 @@ NO_PROXY=127.0.0.1,localhost
 Важно: proxy на том же VPS, где уже возникает `403 unsupported_country_region_territory`, проблему не решит. Выходной IP proxy должен быть в поддерживаемой OpenAI стране.
 
 При `OPENAI_PROXY` сервис использует отдельный `httpx`-клиент без чтения глобальных `HTTP_PROXY` / `HTTPS_PROXY`, чтобы не смешивать маршруты. Если в диагностике видны `CONNECT tunnel failed` или `httpx.ConnectTimeout`, сначала проверьте сам proxy через `curl -x ... https://api.openai.com/v1/models ...`: это обычно означает проблему в proxy/firewall, а не в API-ключе OpenAI.
+
+Начиная с текущей версии daemon сам делает управляемые повторы OpenAI-запросов и, если `OPENAI_PROXY` перестал отвечать, ставит proxy-маршрут на паузу на `OPENAI_PROXY_FAILURE_COOLDOWN_SEC`. Это уменьшает пустую нагрузку на цикл обработки, но не заменяет починку самого proxy.
 
 ### 4. Подставьте актуальную инструкцию
 
