@@ -1,0 +1,17 @@
+[Unit]
+Description=Call Brief AI daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=callbot
+Group=callbot
+WorkingDirectory=/opt/call_brief_ai/current
+EnvironmentFile=/opt/call_brief_ai/shared/.env
+ExecStart=/opt/call_brief_ai/current/.venv/bin/python /opt/call_brief_ai/current/callbot_daemon.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
