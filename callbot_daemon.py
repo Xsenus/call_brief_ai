@@ -22,7 +22,13 @@ import httpx
 import paramiko
 import requests
 from dotenv import load_dotenv
-from openai import APIStatusError, OpenAI, PermissionDeniedError
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    OpenAI,
+    PermissionDeniedError,
+)
 
 
 load_dotenv()
@@ -41,6 +47,8 @@ AUDIO_EXTENSIONS = {
 }
 TELEGRAM_TEXT_LIMIT = 3900
 DEFAULT_TRANSCRIBE_MAX_BYTES = 25 * 1024 * 1024
+DEFAULT_OPENAI_TIMEOUT_SEC = 600.0
+DEFAULT_OPENAI_CONNECT_TIMEOUT_SEC = 30.0
 
 
 class ReusedSessionFTP_TLS(FTP_TLS):
@@ -142,7 +150,35 @@ def build_requests_proxies(proxy_url: str) -> Optional[Dict[str, str]]:
     }
 
 
-def describe_processing_error(exc: BaseException) -> Dict[str, Any]:
+def iter_exception_chain(exc: BaseException):
+    current: Optional[BaseException] = exc
+    seen = set()
+    while current is not None and id(current) not in seen:
+        yield current
+        seen.add(id(current))
+        next_exc = current.__cause__ or current.__context__
+        current = next_exc if isinstance(next_exc, BaseException) else None
+
+
+def build_openai_connectivity_hint(openai_proxy: str) -> str:
+    if openai_proxy:
+        return (
+            "OpenAI traffic is routed through OPENAI_PROXY. Verify from the app VPS "
+            "that the proxy itself works with curl. If curl returns "
+            "`CONNECT tunnel failed` or times out, fix the proxy server, firewall, "
+            "or allow-list first. The proxy must run on a separate VPS with an "
+            "egress IP in a supported OpenAI region."
+        )
+    return (
+        "Check outbound connectivity to api.openai.com, or route OpenAI traffic "
+        "through OPENAI_PROXY / OPENAI_BASE_URL using a supported-region egress."
+    )
+
+
+def describe_processing_error(
+    exc: BaseException,
+    openai_proxy: str = "",
+) -> Dict[str, Any]:
     message = str(exc).strip() or exc.__class__.__name__
     details: Dict[str, Any] = {
         "class": exc.__class__.__name__,
@@ -155,7 +191,45 @@ def describe_processing_error(exc: BaseException) -> Dict[str, Any]:
         "hint": None,
         "retryable": True,
     }
+    exception_chain = list(iter_exception_chain(exc))
     if not isinstance(exc, APIStatusError):
+        if any(isinstance(item, httpx.ProxyError) for item in exception_chain):
+            details["provider"] = "openai"
+            details["code"] = "proxy_error"
+            details["type"] = "connection_error"
+            details["hint"] = build_openai_connectivity_hint(openai_proxy)
+            if details["message"] == exc.__class__.__name__:
+                details["message"] = "OpenAI proxy rejected or could not tunnel the request"
+            return details
+        if any(isinstance(item, httpx.ConnectTimeout) for item in exception_chain):
+            details["provider"] = "openai"
+            details["code"] = "connect_timeout"
+            details["type"] = "timeout"
+            details["hint"] = build_openai_connectivity_hint(openai_proxy)
+            details["message"] = (
+                "Timed out while connecting to the OpenAI route"
+                if openai_proxy
+                else "Timed out while connecting to OpenAI"
+            )
+            return details
+        if any(
+            isinstance(item, (APITimeoutError, httpx.ReadTimeout, httpx.WriteTimeout))
+            for item in exception_chain
+        ):
+            details["provider"] = "openai"
+            details["code"] = "timeout"
+            details["type"] = "timeout"
+            details["hint"] = build_openai_connectivity_hint(openai_proxy)
+            return details
+        if any(
+            isinstance(item, (APIConnectionError, httpx.ConnectError))
+            for item in exception_chain
+        ):
+            details["provider"] = "openai"
+            details["code"] = "connection_error"
+            details["type"] = "connection_error"
+            details["hint"] = build_openai_connectivity_hint(openai_proxy)
+            return details
         return details
 
     details["provider"] = "openai"
@@ -219,6 +293,8 @@ class Config:
     openai_api_key: str
     openai_base_url: str
     openai_proxy: str
+    openai_timeout_sec: float
+    openai_connect_timeout_sec: float
     transcribe_model: str
     transcribe_language: str
     transcribe_chunking_strategy: str
@@ -291,6 +367,24 @@ class Config:
             openai_api_key=os.environ["OPENAI_API_KEY"],
             openai_base_url=os.getenv("OPENAI_BASE_URL", "").strip(),
             openai_proxy=os.getenv("OPENAI_PROXY", "").strip(),
+            openai_timeout_sec=max(
+                1.0,
+                float(
+                    os.getenv(
+                        "OPENAI_TIMEOUT_SEC",
+                        str(DEFAULT_OPENAI_TIMEOUT_SEC),
+                    )
+                ),
+            ),
+            openai_connect_timeout_sec=max(
+                1.0,
+                float(
+                    os.getenv(
+                        "OPENAI_CONNECT_TIMEOUT_SEC",
+                        str(DEFAULT_OPENAI_CONNECT_TIMEOUT_SEC),
+                    )
+                ),
+            ),
             transcribe_model=os.getenv(
                 "OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe-diarize"
             ).strip(),
@@ -1352,6 +1446,20 @@ def send_telegram_message(cfg: Config, text: str) -> List[Dict[str, Any]]:
     return results
 
 
+def build_openai_http_client(cfg: Config) -> Optional[httpx.Client]:
+    if not cfg.openai_proxy:
+        return None
+    timeout = httpx.Timeout(
+        cfg.openai_timeout_sec,
+        connect=cfg.openai_connect_timeout_sec,
+    )
+    return httpx.Client(
+        proxy=cfg.openai_proxy,
+        timeout=timeout,
+        trust_env=False,
+    )
+
+
 def process_remote_audio(
     cfg: Config,
     client: OpenAI,
@@ -1486,7 +1594,7 @@ def process_remote_audio(
                 )
             logging.info("Done: %s", remote_audio_path)
     except Exception as exc:
-        error_details = describe_processing_error(exc)
+        error_details = describe_processing_error(exc, cfg.openai_proxy)
         logging.exception("Processing failed for %s", remote_audio_path)
         if error_details.get("hint"):
             logging.error("%s", error_details["hint"])
@@ -1619,6 +1727,7 @@ def scan_cycle(cfg: Config, client: OpenAI, state: Dict[str, Any]) -> None:
 def main() -> None:
     setup_logging()
     cfg = Config.from_env()
+    openai_http_client: Optional[httpx.Client] = None
 
     cfg.work_root.mkdir(parents=True, exist_ok=True)
     ensure_parent_dir(cfg.state_path)
@@ -1644,30 +1753,37 @@ def main() -> None:
         client_kwargs["base_url"] = cfg.openai_base_url
         logging.info("Using custom OpenAI base URL: %s", cfg.openai_base_url)
     if cfg.openai_proxy:
-        client_kwargs["http_client"] = httpx.Client(
-            proxy=cfg.openai_proxy,
-            trust_env=True,
+        openai_http_client = build_openai_http_client(cfg)
+        client_kwargs["http_client"] = openai_http_client
+        logging.info(
+            "Using dedicated OpenAI proxy from OPENAI_PROXY "
+            "(connect timeout: %.1f sec, overall timeout: %.1f sec).",
+            cfg.openai_connect_timeout_sec,
+            cfg.openai_timeout_sec,
         )
-        logging.info("Using dedicated OpenAI proxy from OPENAI_PROXY.")
     if cfg.telegram_proxy:
         logging.info("Using dedicated Telegram proxy from TELEGRAM_PROXY.")
-    client = OpenAI(**client_kwargs)
-    state = load_state(cfg.state_path)
+    try:
+        client = OpenAI(**client_kwargs)
+        state = load_state(cfg.state_path)
 
-    logging.info(
-        "Daemon started. Poll interval: %s sec. Protocol: %s. Remote root: %s",
-        cfg.poll_interval_sec,
-        cfg.ftp_protocol,
-        cfg.ftp_remote_root,
-    )
-    while True:
-        try:
-            scan_cycle(cfg, client, state)
-        except KeyboardInterrupt:
-            raise
-        except Exception:
-            logging.exception("Cycle crashed")
-        time.sleep(cfg.poll_interval_sec)
+        logging.info(
+            "Daemon started. Poll interval: %s sec. Protocol: %s. Remote root: %s",
+            cfg.poll_interval_sec,
+            cfg.ftp_protocol,
+            cfg.ftp_remote_root,
+        )
+        while True:
+            try:
+                scan_cycle(cfg, client, state)
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                logging.exception("Cycle crashed")
+            time.sleep(cfg.poll_interval_sec)
+    finally:
+        if openai_http_client is not None:
+            openai_http_client.close()
 
 
 if __name__ == "__main__":

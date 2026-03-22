@@ -157,6 +157,8 @@ nano /opt/call_brief_ai/shared/.env
 OPENAI_API_KEY=sk-...
 OPENAI_BASE_URL=
 OPENAI_PROXY=
+OPENAI_TIMEOUT_SEC=600
+OPENAI_CONNECT_TIMEOUT_SEC=30
 OPENAI_TRANSCRIBE_MODEL=gpt-4o-transcribe-diarize
 OPENAI_TRANSCRIBE_LANGUAGE=ru
 OPENAI_CHUNKING_STRATEGY=auto
@@ -212,6 +214,13 @@ LOG_LEVEL=INFO
 
 ```dotenv
 OPENAI_PROXY=http://login:password@PROXY_HOST:8888
+```
+
+Если proxy отвечает нестабильно, можно увеличить таймауты для OpenAI-маршрута:
+
+```dotenv
+OPENAI_TIMEOUT_SEC=600
+OPENAI_CONNECT_TIMEOUT_SEC=30
 ```
 
 Для Telegram можно задать отдельный proxy:
@@ -296,6 +305,8 @@ curl -x http://callbot:StrongPassword123@PROXY_VPS_IP:8888 \
   https://api.openai.com/v1/models \
   -H "Authorization: Bearer $OPENAI_API_KEY"
 ```
+
+Если здесь видите `CONNECT tunnel failed`, `400`, `403` от proxy или просто timeout, сначала чините proxy/firewall/allow-list на proxy-VPS. В таком состоянии сам `callbot` работать не сможет, потому что OpenAI-трафик до API не доходит.
 
 Если `curl` проходит, добавьте на основном VPS в `/opt/call_brief_ai/shared/.env`:
 
@@ -616,6 +627,8 @@ cat /opt/call_brief_ai/shared/.env
 ### Ошибка OpenAI / Telegram / FTP / SFTP
 
 Если ошибка OpenAI выглядит как `403 unsupported_country_region_territory`, проверьте `OPENAI_PROXY` или `OPENAI_BASE_URL`. Proxy должен находиться на отдельном VPS в поддерживаемой стране, а не на том же сервере, где уже возникает блокировка.
+
+Если после включения `OPENAI_PROXY` ошибка меняется на `httpx.ConnectTimeout`, `openai.APITimeoutError` или `CONNECT tunnel failed`, значит маршрут до proxy или сам proxy настроен неверно. Сначала добейтесь, чтобы `curl -x ... https://api.openai.com/v1/models ...` стабильно проходил с основного VPS, и только потом перезапускайте `callbot`.
 
 Запустите сервис вручную для диагностики:
 
