@@ -77,6 +77,7 @@ cp .env.example .env
 
 - `FTP_PROTOCOL=sftp` для SFTP, `ftp` для FTP/FTPS.
 - `FTP_USE_TLS=1` актуален только для FTP/FTPS.
+- `FTP_ENCODING` задает кодировку FTP-листинга; для старых серверов с кириллицей часто нужен `cp1251`.
 - `FTP_TIMEOUT_SEC=60` задает timeout одного подключения.
 - `FTP_CONNECT_ATTEMPTS=2` и `FTP_RETRY_DELAY_SEC=5` добавляют повтор подключения, если хранилище временно не отвечает.
 - `SPLIT_THRESHOLD_BYTES=4194304` и `TARGET_PART_MAX_BYTES=4194304` задают разбиение по 4 МБ.

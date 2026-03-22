@@ -78,6 +78,11 @@ def env_optional_int(name: str) -> Optional[int]:
     return int(raw)
 
 
+def env_csv(name: str, default: str = "") -> List[str]:
+    raw = os.getenv(name, default)
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -137,6 +142,8 @@ class Config:
     ftp_port: int
     ftp_user: str
     ftp_password: str
+    ftp_encoding: str
+    ftp_encoding_fallbacks: List[str]
     ftp_remote_root: str
     ftp_archive_dir: str
     ftp_delete_after_success: bool
@@ -186,6 +193,11 @@ class Config:
             ftp_port=int(os.getenv("FTP_PORT", ftp_port_default)),
             ftp_user=ftp_user or os.environ["FTP_USER"],
             ftp_password=os.environ["FTP_PASSWORD"],
+            ftp_encoding=os.getenv("FTP_ENCODING", "utf-8").strip() or "utf-8",
+            ftp_encoding_fallbacks=env_csv(
+                "FTP_ENCODING_FALLBACKS",
+                "cp1251,cp866,latin-1",
+            ),
             ftp_remote_root=normalize_remote_path(
                 (
                     os.getenv("FTP_REMOTE_ROOT")
@@ -385,9 +397,9 @@ def connect_with_retry(cfg: Config, protocol: str, fn):
     ) from last_exc
 
 
-def ftp_connect_once(cfg: Config):
+def ftp_connect_once(cfg: Config, encoding: Optional[str] = None):
     ftp = ReusedSessionFTP_TLS() if cfg.ftp_use_tls else FTP()
-    ftp.encoding = "utf-8"
+    ftp.encoding = encoding or cfg.ftp_encoding
     ftp.connect(cfg.ftp_host, cfg.ftp_port, timeout=cfg.ftp_timeout_sec)
     ftp.login(cfg.ftp_user, cfg.ftp_password)
     if cfg.ftp_use_tls and isinstance(ftp, FTP_TLS):
@@ -395,8 +407,12 @@ def ftp_connect_once(cfg: Config):
     return ftp
 
 
-def ftp_connect(cfg: Config):
-    return connect_with_retry(cfg, "ftp", lambda: ftp_connect_once(cfg))
+def ftp_connect(cfg: Config, encoding: Optional[str] = None):
+    return connect_with_retry(
+        cfg,
+        "ftp",
+        lambda: ftp_connect_once(cfg, encoding=encoding),
+    )
 
 
 def ftp_download_file(cfg: Config, remote_path: str, local_path: Path) -> None:
@@ -668,11 +684,51 @@ def ftp_walk(ftp, root: str) -> List[Dict[str, Any]]:
         return ftp_walk_nlst(ftp, root)
 
 
+def iter_ftp_encodings(cfg: Config) -> List[str]:
+    seen = set()
+    result: List[str] = []
+    for encoding in [cfg.ftp_encoding, *cfg.ftp_encoding_fallbacks]:
+        normalized = (encoding or "").strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(normalized)
+    return result
+
+
 def remote_walk(cfg: Config) -> List[Dict[str, Any]]:
     if cfg.ftp_protocol == "sftp":
         return sftp_walk(cfg, cfg.ftp_remote_root)
-    with closing(ftp_connect(cfg)) as ftp:
-        return ftp_walk(ftp, cfg.ftp_remote_root)
+
+    decode_errors: List[UnicodeDecodeError] = []
+    for encoding in iter_ftp_encodings(cfg):
+        try:
+            with closing(ftp_connect(cfg, encoding=encoding)) as ftp:
+                files = ftp_walk(ftp, cfg.ftp_remote_root)
+            if encoding.lower() != cfg.ftp_encoding.lower():
+                logging.warning(
+                    "FTP listing is not valid %s; switched runtime encoding to %s. "
+                    "Set FTP_ENCODING=%s to make it permanent.",
+                    cfg.ftp_encoding,
+                    encoding,
+                    encoding,
+                )
+                cfg.ftp_encoding = encoding
+            return files
+        except UnicodeDecodeError as exc:
+            decode_errors.append(exc)
+            logging.warning(
+                "FTP listing decode failed with %s: %s",
+                encoding,
+                exc,
+            )
+
+    if decode_errors:
+        raise decode_errors[-1]
+    raise RuntimeError("FTP listing failed before any encoding candidates were tried")
 
 
 def remote_download_file(cfg: Config, remote_path: str, local_path: Path) -> None:
