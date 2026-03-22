@@ -135,7 +135,7 @@ id -u callbot >/dev/null 2>&1 || useradd --system --create-home --home-dir /opt/
 mkdir -p /opt/call_brief_ai/releases
 mkdir -p /opt/call_brief_ai/shared/work
 mkdir -p /opt/call_brief_ai/shared/logs
-touch /opt/call_brief_ai/shared/state.json
+printf '{\n  "files": {}\n}\n' > /opt/call_brief_ai/shared/state.json
 touch /opt/call_brief_ai/shared/.env
 touch /opt/call_brief_ai/shared/instructions.json
 chown -R callbot:callbot /opt/call_brief_ai

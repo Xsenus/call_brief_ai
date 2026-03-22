@@ -6,6 +6,7 @@ import os
 import posixpath
 import re
 import shutil
+import ssl
 import stat
 import subprocess
 import tempfile
@@ -39,6 +40,28 @@ AUDIO_EXTENSIONS = {
 }
 TELEGRAM_TEXT_LIMIT = 3900
 DEFAULT_TRANSCRIBE_MAX_BYTES = 25 * 1024 * 1024
+
+
+class ReusedSessionFTP_TLS(FTP_TLS):
+    def ntransfercmd(self, cmd, rest=None):
+        conn, size = super(FTP_TLS, self).ntransfercmd(cmd, rest)
+        if not self._prot_p:
+            return conn, size
+
+        wrap_kwargs = {"server_hostname": self.host}
+        session = getattr(self.sock, "session", None)
+        if session is not None:
+            wrap_kwargs["session"] = session
+
+        try:
+            conn = self.context.wrap_socket(conn, **wrap_kwargs)
+        except TypeError:
+            wrap_kwargs.pop("session", None)
+            conn = self.context.wrap_socket(conn, **wrap_kwargs)
+        except ssl.SSLError:
+            conn.close()
+            raise
+        return conn, size
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -253,9 +276,22 @@ def load_state(path: Path) -> Dict[str, Any]:
     if not path.exists():
         return {"files": {}}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+        raw = path.read_text(encoding="utf-8")
+        if not raw.strip():
+            return {"files": {}}
+        state = json.loads(raw)
+        if not isinstance(state, dict):
+            logging.warning("State file root is not an object, starting from empty: %s", path)
+            return {"files": {}}
+        files = state.get("files")
+        if not isinstance(files, dict):
+            state["files"] = {}
+        return state
+    except json.JSONDecodeError:
         logging.exception("Could not parse state file, starting from empty: %s", path)
+        return {"files": {}}
+    except OSError:
+        logging.exception("Could not read state file, starting from empty: %s", path)
         return {"files": {}}
 
 
@@ -350,7 +386,7 @@ def connect_with_retry(cfg: Config, protocol: str, fn):
 
 
 def ftp_connect_once(cfg: Config):
-    ftp = FTP_TLS() if cfg.ftp_use_tls else FTP()
+    ftp = ReusedSessionFTP_TLS() if cfg.ftp_use_tls else FTP()
     ftp.encoding = "utf-8"
     ftp.connect(cfg.ftp_host, cfg.ftp_port, timeout=cfg.ftp_timeout_sec)
     ftp.login(cfg.ftp_user, cfg.ftp_password)
