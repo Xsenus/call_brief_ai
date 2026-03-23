@@ -9,3 +9,6 @@ state.json
 state.json.tmp
 work/
 release.tar.gz
+
+# Temporary folders created by local OpenAI tooling
+.tmp_openai_*/
