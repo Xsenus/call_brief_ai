@@ -320,6 +320,29 @@ class AnalysisDefaultsTests(unittest.TestCase):
 
 
 class RouteProbeTests(unittest.TestCase):
+    def test_run_openai_request_does_not_pause_proxy_for_route_probe(self):
+        cfg = make_config(openai_proxy="http://proxy.example:8888")
+        clients = daemon.OpenAIClients(
+            primary=mock.Mock(),
+            direct_fallback=None,
+            proxy_enabled=True,
+            proxy_failure_cooldown_sec=60,
+        )
+
+        with mock.patch(
+            "callbot_daemon.execute_openai_request",
+            side_effect=httpx.ConnectError("Connection error"),
+        ):
+            with self.assertRaises(httpx.ConnectError):
+                daemon.run_openai_request(
+                    clients,
+                    "route probe",
+                    cfg,
+                    lambda _: {"ok": True},
+                )
+
+        self.assertFalse(daemon.openai_proxy_route_is_in_cooldown(clients))
+
     def test_route_probe_connection_error_is_advisory_without_fallback(self):
         cfg = make_config(openai_proxy="http://proxy.example:8888")
         clients = daemon.OpenAIClients(

@@ -730,7 +730,8 @@ def run_openai_request(
     except Exception as exc:
         error_details = describe_processing_error(exc, cfg.openai_proxy)
         if (
-            is_openai_proxy_route_error(cfg, error_details)
+            operation != "route probe"
+            and is_openai_proxy_route_error(cfg, error_details)
             and openai_clients.proxy_enabled
         ):
             pause_openai_proxy_route(openai_clients, error_details)
