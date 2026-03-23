@@ -55,6 +55,9 @@ DEFAULT_OPENAI_REQUEST_ATTEMPTS = 2
 DEFAULT_OPENAI_RETRY_DELAY_SEC = 2.0
 DEFAULT_OPENAI_RETRY_BACKOFF = 2.0
 DEFAULT_OPENAI_PROXY_FAILURE_COOLDOWN_SEC = 300.0
+DEFAULT_ANALYSIS_REASONING_EFFORT = "low"
+MIN_ANALYSIS_RETRY_MAX_OUTPUT_TOKENS = 2500
+MAX_ANALYSIS_RETRY_MAX_OUTPUT_TOKENS = 6000
 T = TypeVar("T")
 
 
@@ -112,6 +115,17 @@ def normalize_remote_path(path: str) -> str:
     if not normalized.startswith("/"):
         normalized = f"/{normalized}"
     return normalized
+
+
+def model_supports_reasoning_effort(model: str) -> bool:
+    normalized = (model or "").strip().lower()
+    return normalized.startswith("gpt-5") or normalized.startswith("o")
+
+
+def default_analysis_reasoning_effort(model: str) -> str:
+    if model_supports_reasoning_effort(model):
+        return DEFAULT_ANALYSIS_REASONING_EFFORT
+    return ""
 
 
 def join_remote_path(base: str, name: str) -> str:
@@ -343,6 +357,13 @@ class Config:
             or os.getenv("FTP_USERNAME")
             or ""
         ).strip()
+        transcribe_model = os.getenv(
+            "OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe-diarize"
+        ).strip()
+        analysis_model = os.getenv("OPENAI_ANALYSIS_MODEL", "gpt-5-mini").strip()
+        analysis_reasoning_effort_raw = os.getenv(
+            "OPENAI_ANALYSIS_REASONING_EFFORT", ""
+        ).strip()
         ftp_port_default = "22" if ftp_protocol == "sftp" else "21"
         return cls(
             ftp_protocol=ftp_protocol,
@@ -457,17 +478,16 @@ class Config:
                 "OPENAI_PROXY_DIRECT_FALLBACK",
                 False,
             ),
-            transcribe_model=os.getenv(
-                "OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe-diarize"
-            ).strip(),
+            transcribe_model=transcribe_model,
             transcribe_language=os.getenv("OPENAI_TRANSCRIBE_LANGUAGE", "ru").strip(),
             transcribe_chunking_strategy=os.getenv(
                 "OPENAI_CHUNKING_STRATEGY", "auto"
             ).strip(),
-            analysis_model=os.getenv("OPENAI_ANALYSIS_MODEL", "gpt-5-mini").strip(),
-            analysis_reasoning_effort=os.getenv(
-                "OPENAI_ANALYSIS_REASONING_EFFORT", ""
-            ).strip(),
+            analysis_model=analysis_model,
+            analysis_reasoning_effort=(
+                analysis_reasoning_effort_raw
+                or default_analysis_reasoning_effort(analysis_model)
+            ),
             analysis_store=env_bool("OPENAI_ANALYSIS_STORE", False),
             analysis_max_output_tokens=int(
                 os.getenv("OPENAI_ANALYSIS_MAX_OUTPUT_TOKENS", "1800")
@@ -1663,30 +1683,216 @@ def build_transcript_document(
     }
 
 
-def extract_response_text(response: Any) -> str:
-    output_text = getattr(response, "output_text", None)
-    if isinstance(output_text, str) and output_text.strip():
-        return output_text.strip()
+def extract_response_string(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("text", "value", "refusal"):
+            nested = value.get(key)
+            if isinstance(nested, str) and nested.strip():
+                return nested.strip()
+            if isinstance(nested, dict):
+                text = extract_response_string(nested)
+                if text:
+                    return text
+    return ""
 
+
+def inspect_response_output(response: Any) -> Dict[str, Any]:
     data = response_to_dict(response)
+    output_text = getattr(response, "output_text", None)
     collected: List[str] = []
+    if isinstance(output_text, str) and output_text.strip():
+        collected.append(output_text.strip())
+
+    refusals: List[str] = []
+    output_types: List[str] = []
+    message_statuses: List[str] = []
+    phases: List[str] = []
     for item in data.get("output") or []:
-        if item.get("type") != "message":
+        item_type = str(item.get("type") or "").strip() or "<unknown>"
+        output_types.append(item_type)
+        if item_type != "message":
             continue
+
+        item_status = str(item.get("status") or "").strip()
+        if item_status:
+            message_statuses.append(item_status)
+        item_phase = str(item.get("phase") or "").strip()
+        if item_phase:
+            phases.append(item_phase)
+
         for content in item.get("content") or []:
-            if content.get("type") == "output_text":
-                piece = str(content.get("text") or "").strip()
+            content_type = str(content.get("type") or "").strip()
+            if content_type == "output_text":
+                piece = extract_response_string(content.get("text"))
                 if piece:
                     collected.append(piece)
-    return "\n".join(collected).strip()
+            elif content_type == "refusal":
+                refusal = extract_response_string(content.get("refusal"))
+                if refusal:
+                    refusals.append(refusal)
+
+    incomplete_reason = ""
+    incomplete_details = data.get("incomplete_details")
+    if isinstance(incomplete_details, dict):
+        incomplete_reason = str(incomplete_details.get("reason") or "").strip()
+
+    unique_text = list(dict.fromkeys(piece for piece in collected if piece))
+    unique_refusals = list(dict.fromkeys(piece for piece in refusals if piece))
+    return {
+        "text": "\n".join(unique_text).strip(),
+        "refusal": "\n".join(unique_refusals).strip(),
+        "response_id": str(data.get("id") or "").strip(),
+        "status": str(data.get("status") or "").strip(),
+        "incomplete_reason": incomplete_reason,
+        "output_types": output_types,
+        "message_statuses": message_statuses,
+        "phases": phases,
+        "usage": data.get("usage") or {},
+    }
 
 
-def analyze_transcript(
+def format_analysis_response_issue(response_info: Dict[str, Any]) -> str:
+    response_id = response_info.get("response_id") or "unknown"
+    status = response_info.get("status") or "unknown"
+    incomplete_reason = response_info.get("incomplete_reason") or "none"
+    output_types = ", ".join(response_info.get("output_types") or []) or "none"
+    message_statuses = (
+        ", ".join(response_info.get("message_statuses") or []) or "none"
+    )
+    refusal = (response_info.get("refusal") or "").strip()
+
+    if refusal:
+        return (
+            "OpenAI analysis returned a refusal "
+            f"(response_id={response_id}, status={status}): {refusal}"
+        )
+    if incomplete_reason == "content_filter":
+        return (
+            "OpenAI analysis was blocked by the content filter "
+            f"(response_id={response_id}, status={status})"
+        )
+    if incomplete_reason == "max_output_tokens":
+        return (
+            "OpenAI analysis produced no assistant text before hitting "
+            "max_output_tokens "
+            f"(response_id={response_id}, status={status}, "
+            f"output_types={output_types}, message_statuses={message_statuses}). "
+            "Increase OPENAI_ANALYSIS_MAX_OUTPUT_TOKENS or lower "
+            "OPENAI_ANALYSIS_REASONING_EFFORT."
+        )
+    return (
+        "OpenAI analysis produced no assistant text "
+        f"(response_id={response_id}, status={status}, "
+        f"incomplete_reason={incomplete_reason}, output_types={output_types}, "
+        f"message_statuses={message_statuses})"
+    )
+
+
+def build_analysis_request(
+    instruction_text: str,
+    transcript_doc: Dict[str, Any],
+    cfg: Config,
+    reasoning_effort: Optional[str] = None,
+    max_output_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
+    selected_reasoning_effort = (
+        cfg.analysis_reasoning_effort
+        if reasoning_effort is None
+        else (reasoning_effort or "").strip()
+    )
+    selected_max_output_tokens = max_output_tokens or cfg.analysis_max_output_tokens
+
+    analysis_payload = {
+        "task": "РЎС„РѕСЂРјРёСЂСѓР№ С‚РѕР»СЊРєРѕ РіРѕС‚РѕРІРѕРµ РёС‚РѕРіРѕРІРѕРµ СЃРѕРѕР±С‰РµРЅРёРµ РґР»СЏ Telegram-РіСЂСѓРїРїС‹ РїРѕ СЌС‚РѕР№ Р·Р°РїРёСЃРё СЂР°Р·РіРѕРІРѕСЂР°.",
+        "rules": {
+            "language": "ru",
+            "return_only_message": True,
+            "max_chars": 3500,
+            "no_preamble": True,
+            "no_code_block": True,
+        },
+        "transcript_json": transcript_doc,
+    }
+    request: Dict[str, Any] = {
+        "model": cfg.analysis_model,
+        "instructions": (
+            instruction_text
+            + "\n\nР”РѕРїРѕР»РЅРёС‚РµР»СЊРЅРѕРµ С‚СЂРµР±РѕРІР°РЅРёРµ: РІРµСЂРЅРё С‚РѕР»СЊРєРѕ РіРѕС‚РѕРІС‹Р№ С‚РµРєСЃС‚ РґР»СЏ РїСѓР±Р»РёРєР°С†РёРё РІ Telegram-РіСЂСѓРїРїСѓ. "
+            + "Р‘РµР· РІРІРѕРґРЅС‹С… СЃР»РѕРІ, Р±РµР· РїРѕСЏСЃРЅРµРЅРёР№ РІРЅРµ СЃР°РјРѕРіРѕ СЃРѕРѕР±С‰РµРЅРёСЏ, Р±РµР· markdown-РєРѕРґР°."
+        ),
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": json.dumps(
+                            analysis_payload,
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                    }
+                ],
+            }
+        ],
+        "text": {"format": {"type": "text"}},
+        "max_output_tokens": selected_max_output_tokens,
+        "store": cfg.analysis_store,
+    }
+    if selected_reasoning_effort:
+        request["reasoning"] = {"effort": selected_reasoning_effort}
+    return request
+
+
+def build_analysis_retry_settings(
+    cfg: Config,
+    response_info: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if response_info.get("text") or response_info.get("refusal"):
+        return None
+
+    incomplete_reason = (response_info.get("incomplete_reason") or "").strip()
+    if incomplete_reason and incomplete_reason != "max_output_tokens":
+        return None
+
+    current_effort = (cfg.analysis_reasoning_effort or "").strip().lower()
+    retry_effort = current_effort
+    if model_supports_reasoning_effort(cfg.analysis_model) and current_effort not in {
+        "none",
+        "minimal",
+        "low",
+    }:
+        retry_effort = DEFAULT_ANALYSIS_REASONING_EFFORT
+
+    retry_max_output_tokens = min(
+        max(
+            cfg.analysis_max_output_tokens * 2,
+            MIN_ANALYSIS_RETRY_MAX_OUTPUT_TOKENS,
+        ),
+        MAX_ANALYSIS_RETRY_MAX_OUTPUT_TOKENS,
+    )
+    if (
+        retry_effort == current_effort
+        and retry_max_output_tokens == cfg.analysis_max_output_tokens
+    ):
+        return None
+
+    return {
+        "reasoning_effort": retry_effort,
+        "max_output_tokens": retry_max_output_tokens,
+    }
+
+
+def _legacy_analyze_transcript(
     client: OpenAIClients,
     instruction_text: str,
     transcript_doc: Dict[str, Any],
     cfg: Config,
 ) -> str:
+    return analyze_transcript(client, instruction_text, transcript_doc, cfg)
+
     analysis_payload = {
         "task": "Сформируй только готовое итоговое сообщение для Telegram-группы по этой записи разговора.",
         "rules": {
@@ -1736,6 +1942,56 @@ def analyze_transcript(
     if not text:
         raise RuntimeError("OpenAI analysis returned an empty message")
     return text
+
+
+def analyze_transcript(
+    client: OpenAIClients,
+    instruction_text: str,
+    transcript_doc: Dict[str, Any],
+    cfg: Config,
+) -> str:
+    request = build_analysis_request(instruction_text, transcript_doc, cfg)
+    response = run_openai_request(
+        client,
+        "analysis request",
+        cfg,
+        lambda openai_client: openai_client.responses.create(**request),
+    )
+    response_info = inspect_response_output(response)
+    if response_info["text"]:
+        return str(response_info["text"])
+
+    retry_settings = build_analysis_retry_settings(cfg, response_info)
+    if retry_settings is not None:
+        logging.warning(
+            "Analysis response had no assistant text "
+            "(response_id=%s, status=%s, incomplete_reason=%s, output_types=%s). "
+            "Retrying with reasoning effort=%s and max_output_tokens=%s.",
+            response_info.get("response_id") or "-",
+            response_info.get("status") or "-",
+            response_info.get("incomplete_reason") or "-",
+            ",".join(response_info.get("output_types") or []) or "-",
+            retry_settings["reasoning_effort"] or "<unchanged>",
+            retry_settings["max_output_tokens"],
+        )
+        retry_request = build_analysis_request(
+            instruction_text,
+            transcript_doc,
+            cfg,
+            reasoning_effort=retry_settings["reasoning_effort"],
+            max_output_tokens=retry_settings["max_output_tokens"],
+        )
+        response = run_openai_request(
+            client,
+            "analysis retry",
+            cfg,
+            lambda openai_client: openai_client.responses.create(**retry_request),
+        )
+        response_info = inspect_response_output(response)
+        if response_info["text"]:
+            return str(response_info["text"])
+
+    raise RuntimeError(format_analysis_response_issue(response_info))
 
 
 def split_text_for_telegram(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> List[str]:
