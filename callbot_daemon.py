@@ -49,6 +49,8 @@ TELEGRAM_TEXT_LIMIT = 3900
 DEFAULT_TRANSCRIBE_MAX_BYTES = 25 * 1024 * 1024
 DEFAULT_OPENAI_TIMEOUT_SEC = 600.0
 DEFAULT_OPENAI_CONNECT_TIMEOUT_SEC = 30.0
+DEFAULT_OPENAI_ROUTE_PROBE_TIMEOUT_SEC = 15.0
+DEFAULT_OPENAI_ROUTE_PROBE_CONNECT_TIMEOUT_SEC = 5.0
 DEFAULT_OPENAI_REQUEST_ATTEMPTS = 2
 DEFAULT_OPENAI_RETRY_DELAY_SEC = 2.0
 DEFAULT_OPENAI_RETRY_BACKOFF = 2.0
@@ -300,6 +302,8 @@ class Config:
     openai_proxy: str
     openai_timeout_sec: float
     openai_connect_timeout_sec: float
+    openai_route_probe_timeout_sec: float
+    openai_route_probe_connect_timeout_sec: float
     openai_request_attempts: int
     openai_retry_delay_sec: float
     openai_retry_backoff: float
@@ -392,6 +396,24 @@ class Config:
                     os.getenv(
                         "OPENAI_CONNECT_TIMEOUT_SEC",
                         str(DEFAULT_OPENAI_CONNECT_TIMEOUT_SEC),
+                    )
+                ),
+            ),
+            openai_route_probe_timeout_sec=max(
+                1.0,
+                float(
+                    os.getenv(
+                        "OPENAI_ROUTE_PROBE_TIMEOUT_SEC",
+                        str(DEFAULT_OPENAI_ROUTE_PROBE_TIMEOUT_SEC),
+                    )
+                ),
+            ),
+            openai_route_probe_connect_timeout_sec=max(
+                1.0,
+                float(
+                    os.getenv(
+                        "OPENAI_ROUTE_PROBE_CONNECT_TIMEOUT_SEC",
+                        str(DEFAULT_OPENAI_ROUTE_PROBE_CONNECT_TIMEOUT_SEC),
                     )
                 ),
             ),
@@ -507,6 +529,13 @@ def build_openai_timeout(cfg: Config) -> httpx.Timeout:
     )
 
 
+def build_openai_route_probe_timeout(cfg: Config) -> httpx.Timeout:
+    return httpx.Timeout(
+        cfg.openai_route_probe_timeout_sec,
+        connect=cfg.openai_route_probe_connect_timeout_sec,
+    )
+
+
 def build_openai_client_kwargs(
     cfg: Config,
     http_client: Optional[httpx.Client] = None,
@@ -602,6 +631,8 @@ def pause_openai_proxy_route(
     error_details: Dict[str, Any],
 ) -> None:
     now = time.monotonic()
+    if openai_clients.proxy_unavailable_until > now:
+        return
     openai_clients.proxy_unavailable_until = max(
         openai_clients.proxy_unavailable_until,
         now + openai_clients.proxy_failure_cooldown_sec,
@@ -706,7 +737,9 @@ def verify_openai_route_before_processing(
             openai_clients,
             "route probe",
             cfg,
-            lambda openai_client: openai_client.models.list(),
+            lambda openai_client: openai_client.with_options(
+                timeout=build_openai_route_probe_timeout(cfg)
+            ).models.list(),
         )
         return True
     except Exception as exc:
@@ -2101,6 +2134,11 @@ def main() -> None:
         cfg.openai_request_attempts,
         cfg.openai_retry_delay_sec,
         cfg.openai_retry_backoff,
+    )
+    logging.info(
+        "OpenAI route probe timeout: connect %.1f sec, overall %.1f sec.",
+        cfg.openai_route_probe_connect_timeout_sec,
+        cfg.openai_route_probe_timeout_sec,
     )
     if cfg.openai_proxy_direct_fallback:
         logging.warning(

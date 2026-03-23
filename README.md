@@ -79,6 +79,7 @@ cp .env.example .env
 - `OPENAI_PROXY` задает отдельный HTTP/HTTPS proxy только для OpenAI.
 - `OPENAI_TIMEOUT_SEC=600` задает общий timeout OpenAI-запроса.
 - `OPENAI_CONNECT_TIMEOUT_SEC=30` увеличивает timeout на подключение к proxy/OpenAI, что особенно полезно при `OPENAI_PROXY`.
+- `OPENAI_ROUTE_PROBE_TIMEOUT_SEC=15` и `OPENAI_ROUTE_PROBE_CONNECT_TIMEOUT_SEC=5` задают короткую проверку маршрута перед скачиванием аудио, чтобы быстрее понять, что proxy недоступен.
 - `OPENAI_REQUEST_ATTEMPTS=2`, `OPENAI_RETRY_DELAY_SEC=2` и `OPENAI_RETRY_BACKOFF=2` управляют повтором OpenAI-запросов при временных сетевых сбоях.
 - `OPENAI_PROXY_FAILURE_COOLDOWN_SEC=300` временно останавливает попытки через умерший `OPENAI_PROXY`, чтобы сервис не тратил весь цикл на одинаковые таймауты.
 - `OPENAI_PROXY_DIRECT_FALLBACK=1` разрешает временно уйти на прямой маршрут без proxy, но включайте это только если сам VPS может ходить в OpenAI напрямую и это допустимо по региону.
