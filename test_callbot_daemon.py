@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest import mock
 import tempfile
 
+import httpx
 import callbot_daemon as daemon
 
 
@@ -316,6 +317,47 @@ class AnalysisDefaultsTests(unittest.TestCase):
     def test_defaults_reasoning_effort_for_gpt5_models(self):
         self.assertEqual(daemon.default_analysis_reasoning_effort("gpt-5-mini"), "low")
         self.assertEqual(daemon.default_analysis_reasoning_effort("gpt-4.1-mini"), "")
+
+
+class RouteProbeTests(unittest.TestCase):
+    def test_route_probe_connection_error_is_advisory_without_fallback(self):
+        cfg = make_config(openai_proxy="http://proxy.example:8888")
+        clients = daemon.OpenAIClients(
+            primary=mock.Mock(),
+            direct_fallback=None,
+            proxy_enabled=True,
+            proxy_failure_cooldown_sec=60,
+        )
+
+        with mock.patch(
+            "callbot_daemon.run_openai_request",
+            side_effect=httpx.ConnectError("Connection error"),
+        ):
+            result = daemon.verify_openai_route_before_processing(cfg, clients)
+
+        self.assertTrue(result)
+        self.assertFalse(daemon.openai_proxy_route_is_in_cooldown(clients))
+
+    def test_route_probe_connection_error_switches_to_direct_fallback(self):
+        cfg = make_config(
+            openai_proxy="http://proxy.example:8888",
+            openai_proxy_direct_fallback=True,
+        )
+        clients = daemon.OpenAIClients(
+            primary=mock.Mock(),
+            direct_fallback=mock.Mock(),
+            proxy_enabled=True,
+            proxy_failure_cooldown_sec=60,
+        )
+
+        with mock.patch(
+            "callbot_daemon.run_openai_request",
+            side_effect=httpx.ConnectError("Connection error"),
+        ):
+            result = daemon.verify_openai_route_before_processing(cfg, clients)
+
+        self.assertTrue(result)
+        self.assertTrue(daemon.openai_proxy_route_is_in_cooldown(clients))
 
 
 class ConfigDefaultsTests(unittest.TestCase):

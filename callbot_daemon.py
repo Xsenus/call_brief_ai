@@ -781,15 +781,22 @@ def verify_openai_route_before_processing(
             }
         )
         if is_proxy_probe_failure and openai_clients.proxy_enabled:
-            pause_openai_proxy_route(openai_clients, error_details)
-        if is_proxy_probe_failure and openai_clients.direct_fallback is None:
             logging.warning(
                 "OpenAI route probe failed before file processing: %s",
                 error_details.get("message") or exc.__class__.__name__,
             )
             if error_details.get("hint"):
                 logging.error("%s", error_details["hint"])
-            return False
+            if openai_clients.direct_fallback is not None:
+                pause_openai_proxy_route(openai_clients, error_details)
+                logging.warning(
+                    "Continuing cycle with direct OpenAI fallback after route probe failure."
+                )
+            else:
+                logging.warning(
+                    "Continuing cycle despite route probe failure; actual OpenAI requests will retry during processing."
+                )
+            return True
         raise
 
 
