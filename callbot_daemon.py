@@ -445,6 +445,15 @@ def count_words(text: str) -> int:
     return len(re.findall(r"\w+", text or "", flags=re.UNICODE))
 
 
+def safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class Config:
     ftp_protocol: str
@@ -1622,6 +1631,31 @@ def ffprobe_duration_seconds(path: Path) -> Optional[float]:
         return None
 
 
+def build_audio_part_descriptors(parts: List[Path]) -> List[Dict[str, Any]]:
+    descriptors: List[Dict[str, Any]] = []
+    start_offset_sec = 0.0
+    parts_total = len(parts)
+    for index, part in enumerate(parts, start=1):
+        duration_sec = ffprobe_duration_seconds(part)
+        descriptors.append(
+            {
+                "part_index": index,
+                "parts_total": parts_total,
+                "part_name": part.name,
+                "part_path": str(part),
+                "size_bytes": part.stat().st_size,
+                "planned_duration_sec": duration_sec,
+                "planned_duration_min": (
+                    round(duration_sec / 60, 3) if duration_sec is not None else None
+                ),
+                "start_offset_sec": round(start_offset_sec, 3),
+            }
+        )
+        if duration_sec is not None:
+            start_offset_sec += duration_sec
+    return descriptors
+
+
 def parse_bitrate_to_bps(value: str) -> int:
     match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([kKmM]?)\s*", value or "")
     if not match:
@@ -1773,21 +1807,155 @@ def parse_filename_metadata(filename: str) -> Dict[str, Optional[str]]:
         "file_time": None,
         "file_phone": None,
         "manager_name": None,
+        "counterparty_name": None,
         "call_suffix": None,
     }
     parts = stem.split("__")
-    if len(parts) >= 4:
-        result["file_date"] = parts[0] or None
-        result["file_time"] = parts[1] or None
-        result["file_phone"] = parts[2] or None
-        manager_and_suffix = parts[3]
-        match = re.match(r"^(?P<manager>.+?)_(?P<suffix>[^_]+)$", manager_and_suffix)
+    if len(parts) < 4:
+        return result
+
+    result["file_date"] = parts[0].strip() or None
+    result["file_time"] = parts[1].strip() or None
+
+    third = parts[2].strip()
+    fourth = parts[3].strip()
+
+    if re.fullmatch(r"\d{10,15}", third):
+        result["file_phone"] = third
+        match = re.match(r"^(.*?)(?:_(\d+))?$", fourth)
         if match:
-            result["manager_name"] = match.group("manager").strip() or None
-            result["call_suffix"] = match.group("suffix").strip() or None
+            result["manager_name"] = (
+                (match.group(1) or "").replace("_", " ").strip() or None
+            )
+            result["call_suffix"] = match.group(2)
         else:
-            result["manager_name"] = manager_and_suffix.strip() or None
+            result["manager_name"] = fourth.replace("_", " ").strip() or None
+        return result
+
+    result["manager_name"] = third.replace("_", " ").strip() or None
+
+    phone_match = re.match(r"^(\d{10,15})(?:_(\d+))?$", fourth)
+    if phone_match:
+        result["file_phone"] = phone_match.group(1)
+        result["call_suffix"] = phone_match.group(2)
+        return result
+
+    name_match = re.match(r"^(.*?)(?:_(\d+))?$", fourth)
+    if name_match:
+        result["counterparty_name"] = (
+            (name_match.group(1) or "").replace("_", " ").strip() or None
+        )
+        result["call_suffix"] = name_match.group(2)
+    else:
+        result["counterparty_name"] = fourth.replace("_", " ").strip() or None
     return result
+
+
+def document_matches_remote_audio(
+    transcript_doc: Optional[Dict[str, Any]],
+    remote_audio_path: str,
+) -> bool:
+    if not isinstance(transcript_doc, dict):
+        return False
+    source = transcript_doc.get("source")
+    if not isinstance(source, dict):
+        return False
+    return str(source.get("ftp_path_audio") or "").strip() == remote_audio_path
+
+
+def extract_saved_transcription_doc(
+    transcript_doc: Optional[Dict[str, Any]],
+    remote_audio_path: str,
+) -> Optional[Dict[str, Any]]:
+    if not document_matches_remote_audio(transcript_doc, remote_audio_path):
+        return None
+
+    stage = str((transcript_doc or {}).get("stage") or "").strip().lower()
+    if stage not in {"transcribed", "analyzed", "error"}:
+        return None
+
+    transcription = (transcript_doc or {}).get("transcription")
+    if not isinstance(transcription, dict):
+        return None
+    if transcription.get("parts_failed") not in {None, 0}:
+        return None
+    parts = transcription.get("parts")
+    if isinstance(parts, list) and any(
+        str(item.get("status") or "ok") != "ok"
+        for item in parts
+        if isinstance(item, dict)
+    ):
+        return None
+    parts_planned = transcription.get("parts_planned")
+    parts_completed = transcription.get("parts_completed")
+    if (
+        stage == "error"
+        and isinstance(parts_planned, int)
+        and isinstance(parts_completed, int)
+        and parts_completed < parts_planned
+    ):
+        return None
+    if not any(
+        transcription.get(key)
+        for key in ("dialogue_text", "full_text", "segments", "parts")
+    ):
+        return None
+    return transcript_doc
+
+
+def classify_saved_remote_json(
+    transcript_doc: Optional[Dict[str, Any]],
+    remote_audio_path: str,
+) -> str:
+    if not document_matches_remote_audio(transcript_doc, remote_audio_path):
+        return "unknown"
+
+    stage = str((transcript_doc or {}).get("stage") or "").strip().lower()
+    status = str((transcript_doc or {}).get("status") or "").strip().lower()
+
+    if status == "skipped_too_small":
+        return "completed"
+    if stage == "done":
+        return "completed"
+    if extract_saved_telegram_message(transcript_doc, remote_audio_path):
+        return "retry_telegram"
+    if extract_saved_transcription_doc(transcript_doc, remote_audio_path):
+        return "resume_from_transcription"
+    if stage in {"processing", "transcribed", "analyzed", "error"}:
+        return "retry"
+    return "unknown"
+
+
+def merge_usage_values(existing: Any, new: Any) -> Any:
+    if isinstance(new, dict):
+        merged: Dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
+        for key, value in new.items():
+            merged[key] = merge_usage_values(merged.get(key), value)
+        return merged
+
+    if isinstance(new, (int, float)) and not isinstance(new, bool):
+        current = (
+            existing
+            if isinstance(existing, (int, float)) and not isinstance(existing, bool)
+            else 0
+        )
+        total = current + new
+        if isinstance(total, float):
+            return round(total, 6)
+        return total
+
+    if (existing is None or existing == "") and isinstance(new, str) and new.strip():
+        return new
+    return existing
+
+
+def aggregate_usage_records(usage_items: List[Any]) -> Dict[str, Any]:
+    aggregated: Dict[str, Any] = {}
+    for usage in usage_items:
+        if not isinstance(usage, dict):
+            continue
+        aggregated = merge_usage_values(aggregated, usage)
+    return aggregated
 
 
 def build_skip_document(
@@ -1908,28 +2076,66 @@ def build_transcript_document(
     remote_file: Dict[str, Any],
     part_results: List[Dict[str, Any]],
     cfg: Config,
+    planned_parts_count: Optional[int] = None,
+    split_applied: Optional[bool] = None,
 ) -> Dict[str, Any]:
     metadata = parse_filename_metadata(remote_file["name"])
     full_parts: List[str] = []
     all_segments: List[Dict[str, Any]] = []
-    total_duration = 0.0
-    total_usage: Dict[str, Any] = {}
+    total_duration_sec = 0.0
+    first_api_sent_at = ""
+    last_api_finished_at = ""
+    api_elapsed_sec_total = 0.0
+
+    successful_parts = [
+        item for item in part_results if str(item.get("status") or "ok") == "ok"
+    ]
+    usage_items = [item.get("usage") for item in successful_parts]
+    total_usage = aggregate_usage_records(usage_items)
+    derived_planned_parts_count = max(
+        planned_parts_count or 0,
+        len(part_results),
+        max(
+            [
+                int(item.get("parts_total") or 0)
+                for item in part_results
+                if isinstance(item.get("parts_total"), int)
+                or str(item.get("parts_total") or "").isdigit()
+            ]
+            or [0]
+        ),
+    )
+    parts_completed = len(successful_parts)
+    parts_failed = len(part_results) - parts_completed
 
     for item in part_results:
-        full_text = item["full_text"].strip()
-        shifted_segments = shift_segments(item.get("segments") or [], total_duration)
+        api_sent_at = str(item.get("api_sent_at_utc") or "").strip()
+        api_finished_at = str(item.get("api_finished_at_utc") or "").strip()
+        if api_sent_at and not first_api_sent_at:
+            first_api_sent_at = api_sent_at
+        if api_finished_at:
+            last_api_finished_at = api_finished_at
+        api_elapsed_sec_total += safe_float(item.get("api_elapsed_sec"), 0.0) or 0.0
+
+        if str(item.get("status") or "ok") != "ok":
+            continue
+
+        full_text = str(item.get("full_text") or "").strip()
+        offset_sec = safe_float(item.get("start_offset_sec"), None)
+        if offset_sec is None:
+            offset_sec = total_duration_sec
+        shifted_segments = shift_segments(item.get("segments") or [], offset_sec)
         all_segments.extend(shifted_segments)
         if full_text:
             full_parts.append(full_text)
-        if item["duration_sec"]:
-            total_duration += float(item["duration_sec"])
-        for usage_key, usage_value in (item.get("usage") or {}).items():
-            if isinstance(usage_value, (int, float)):
-                total_usage[usage_key] = total_usage.get(usage_key, 0) + usage_value
+
+        part_duration_sec = safe_float(item.get("duration_sec"), None)
+        if part_duration_sec is not None:
+            total_duration_sec = max(total_duration_sec, offset_sec + part_duration_sec)
 
     full_text_joined = "\n\n".join(full_parts).strip()
     dialogue_text_joined = build_dialogue_from_segments(all_segments) or full_text_joined
-    duration_sec_total = round(total_duration, 3) if total_duration else None
+    duration_sec_total = round(total_duration_sec, 3) if total_duration_sec else None
     duration_min_total = (
         round(duration_sec_total / 60, 3) if duration_sec_total is not None else None
     )
@@ -1937,6 +2143,7 @@ def build_transcript_document(
     return {
         "generated_at": now_iso(),
         "stage": "transcribed",
+        "status": "transcribed",
         "source": {
             "ftp_path_audio": remote_file["path"],
             "file_name_audio": remote_file["name"],
@@ -1950,6 +2157,17 @@ def build_transcript_document(
             "duration_sec_total": duration_sec_total,
             "duration_min_total": duration_min_total,
             "word_count": count_words(strip_dialogue_labels(dialogue_text_joined)),
+            "split_applied": (
+                bool(split_applied)
+                if split_applied is not None
+                else derived_planned_parts_count > 1
+            ),
+            "parts_planned": derived_planned_parts_count,
+            "parts_completed": parts_completed,
+            "parts_failed": parts_failed,
+            "api_started_at": first_api_sent_at or None,
+            "api_finished_at": last_api_finished_at or None,
+            "api_elapsed_sec_total": round(api_elapsed_sec_total, 3),
             "full_text": full_text_joined,
             "dialogue_text": dialogue_text_joined,
             "segments": all_segments,
@@ -2357,13 +2575,7 @@ def extract_saved_telegram_message(
     transcript_doc: Optional[Dict[str, Any]],
     remote_audio_path: str,
 ) -> str:
-    if not isinstance(transcript_doc, dict):
-        return ""
-
-    source = transcript_doc.get("source")
-    if not isinstance(source, dict):
-        return ""
-    if str(source.get("ftp_path_audio") or "").strip() != remote_audio_path:
+    if not document_matches_remote_audio(transcript_doc, remote_audio_path):
         return ""
 
     telegram = transcript_doc.get("telegram")
@@ -2471,6 +2683,7 @@ def process_remote_audio(
                 "updated_at": now_iso(),
             }
             transcript_doc["stage"] = "done"
+            transcript_doc["status"] = "ok"
             remote_upload_json(cfg, remote_json_path, transcript_doc)
 
             entry["stage"] = "done"
@@ -2487,119 +2700,191 @@ def process_remote_audio(
             logging.info("Done after Telegram retry: %s", remote_audio_path)
             return
 
-        with tempfile.TemporaryDirectory(dir=cfg.work_root) as tmp_dir_name:
-            tmp_dir = Path(tmp_dir_name)
-            local_audio = tmp_dir / remote_file["name"]
-
-            logging.info("Downloading audio: %s", remote_audio_path)
-            remote_download_file(cfg, remote_audio_path, local_audio)
-
-            logging.info("Normalizing audio: %s", local_audio.name)
-            audio_parts = prepare_audio_parts(local_audio, tmp_dir, cfg)
-
+        reusable_transcript_doc = extract_saved_transcription_doc(
+            transcript_doc,
+            remote_audio_path,
+        )
+        if reusable_transcript_doc is not None:
+            transcript_doc = reusable_transcript_doc
             logging.info(
-                "Transcribing %s part(s) with %s: %s",
-                len(audio_parts),
-                cfg.transcribe_model,
-                local_audio.name,
-            )
-            part_results = [transcribe_part(client, part, cfg) for part in audio_parts]
-
-            transcript_doc = build_transcript_document(remote_file, part_results, cfg)
-            remote_upload_json(cfg, remote_json_path, transcript_doc)
-
-            word_count = int(transcript_doc["transcription"].get("word_count") or 0)
-            duration_min = float(
-                transcript_doc["transcription"].get("duration_min_total") or 0.0
-            )
-            skip_reasons: List[str] = []
-            if duration_min < cfg.min_duration_min:
-                skip_reasons.append(
-                    f"duration shorter than {cfg.min_duration_min} min"
-                )
-            if word_count < cfg.min_dialogue_words:
-                skip_reasons.append(
-                    f"dialogue shorter than {cfg.min_dialogue_words} words"
-                )
-
-            if skip_reasons:
-                transcript_doc["analysis"] = {
-                    "skipped": True,
-                    "reason": "; ".join(skip_reasons),
-                    "word_count": word_count,
-                    "duration_min": duration_min,
-                    "generated_at": now_iso(),
-                }
-                transcript_doc["telegram"] = {
-                    "sent": False,
-                    "reason": "analysis skipped by threshold rules",
-                    "updated_at": now_iso(),
-                }
-                transcript_doc["stage"] = "done"
-                remote_upload_json(cfg, remote_json_path, transcript_doc)
-
-                entry["stage"] = "done"
-                entry["processed_sig"] = entry.get("last_sig")
-                entry["last_finished_at"] = now_iso()
-                entry["skip_reason"] = "; ".join(skip_reasons)
-                save_state(cfg.state_path, state)
-                try:
-                    remote_archive_or_delete(cfg, remote_audio_path)
-                except Exception:
-                    logging.exception(
-                        "Could not archive/delete remote audio after analysis skip: %s",
-                        remote_audio_path,
-                    )
-                logging.info(
-                    "Skipped GPT analysis because transcript did not pass thresholds: %s",
-                    remote_audio_path,
-                )
-                return
-
-            logging.info(
-                "Analyzing transcript with %s: %s",
-                cfg.analysis_model,
+                "Reusing saved transcription and resuming downstream steps: %s",
                 remote_audio_path,
             )
-            telegram_message = analyze_transcript(
-                client,
-                instruction_text,
-                transcript_doc,
-                cfg,
-            )
-            transcript_doc["analysis"] = {
-                "model": cfg.analysis_model,
-                "telegram_message": telegram_message,
-                "generated_at": now_iso(),
-            }
-            transcript_doc["stage"] = "analyzed"
+        else:
+            with tempfile.TemporaryDirectory(dir=cfg.work_root) as tmp_dir_name:
+                tmp_dir = Path(tmp_dir_name)
+                local_audio = tmp_dir / remote_file["name"]
+
+                logging.info("Downloading audio: %s", remote_audio_path)
+                remote_download_file(cfg, remote_audio_path, local_audio)
+
+                logging.info("Normalizing audio: %s", local_audio.name)
+                audio_parts = prepare_audio_parts(local_audio, tmp_dir, cfg)
+                part_descriptors = build_audio_part_descriptors(audio_parts)
+
+                logging.info(
+                    "Transcribing %s part(s) with %s: %s",
+                    len(audio_parts),
+                    cfg.transcribe_model,
+                    local_audio.name,
+                )
+
+                part_results: List[Dict[str, Any]] = []
+                for part, descriptor in zip(audio_parts, part_descriptors):
+                    part_started_at = now_iso()
+                    part_started_perf = time.perf_counter()
+                    try:
+                        part_data = transcribe_part(client, part, cfg)
+                    except Exception as exc:
+                        part_finished_at = now_iso()
+                        part_results.append(
+                            {
+                                **descriptor,
+                                "file_name": descriptor["part_name"],
+                                "status": "error",
+                                "error": str(exc).strip() or exc.__class__.__name__,
+                                "api_sent_at_utc": part_started_at,
+                                "api_finished_at_utc": part_finished_at,
+                                "api_elapsed_sec": round(
+                                    time.perf_counter() - part_started_perf,
+                                    3,
+                                ),
+                                "duration_sec": descriptor.get("planned_duration_sec"),
+                                "full_text": "",
+                                "dialogue_text": "",
+                                "segments": [],
+                                "usage": {},
+                            }
+                        )
+                        transcript_doc = build_transcript_document(
+                            remote_file,
+                            part_results,
+                            cfg,
+                            planned_parts_count=len(part_descriptors),
+                            split_applied=len(part_descriptors) > 1,
+                        )
+                        raise
+
+                    part_finished_at = now_iso()
+                    part_results.append(
+                        {
+                            **descriptor,
+                            **part_data,
+                            "status": "ok",
+                            "error": None,
+                            "api_sent_at_utc": part_started_at,
+                            "api_finished_at_utc": part_finished_at,
+                            "api_elapsed_sec": round(
+                                time.perf_counter() - part_started_perf,
+                                3,
+                            ),
+                        }
+                    )
+
+                transcript_doc = build_transcript_document(
+                    remote_file,
+                    part_results,
+                    cfg,
+                    planned_parts_count=len(part_descriptors),
+                    split_applied=len(part_descriptors) > 1,
+                )
             remote_upload_json(cfg, remote_json_path, transcript_doc)
 
-            logging.info("Sending Telegram message: %s", remote_audio_path)
-            telegram_results = send_telegram_message(cfg, telegram_message)
+        word_count = int(transcript_doc["transcription"].get("word_count") or 0)
+        duration_min = float(
+            transcript_doc["transcription"].get("duration_min_total") or 0.0
+        )
+        skip_reasons: List[str] = []
+        if duration_min < cfg.min_duration_min:
+            skip_reasons.append(
+                f"duration shorter than {cfg.min_duration_min} min"
+            )
+        if word_count < cfg.min_dialogue_words:
+            skip_reasons.append(
+                f"dialogue shorter than {cfg.min_dialogue_words} words"
+            )
+
+        if skip_reasons:
+            transcript_doc["analysis"] = {
+                "skipped": True,
+                "reason": "; ".join(skip_reasons),
+                "word_count": word_count,
+                "duration_min": duration_min,
+                "generated_at": now_iso(),
+            }
             transcript_doc["telegram"] = {
-                "sent": True,
-                "parts_sent": len(telegram_results),
-                "message_ids": [
-                    item.get("result", {}).get("message_id") for item in telegram_results
-                ],
+                "sent": False,
+                "reason": "analysis skipped by threshold rules",
                 "updated_at": now_iso(),
             }
             transcript_doc["stage"] = "done"
+            transcript_doc["status"] = "ok"
             remote_upload_json(cfg, remote_json_path, transcript_doc)
 
             entry["stage"] = "done"
             entry["processed_sig"] = entry.get("last_sig")
             entry["last_finished_at"] = now_iso()
+            entry["skip_reason"] = "; ".join(skip_reasons)
             save_state(cfg.state_path, state)
             try:
                 remote_archive_or_delete(cfg, remote_audio_path)
             except Exception:
                 logging.exception(
-                    "Could not archive/delete remote audio after success: %s",
+                    "Could not archive/delete remote audio after analysis skip: %s",
                     remote_audio_path,
                 )
-            logging.info("Done: %s", remote_audio_path)
+            logging.info(
+                "Skipped GPT analysis because transcript did not pass thresholds: %s",
+                remote_audio_path,
+            )
+            return
+
+        logging.info(
+            "Analyzing transcript with %s: %s",
+            cfg.analysis_model,
+            remote_audio_path,
+        )
+        telegram_message = analyze_transcript(
+            client,
+            instruction_text,
+            transcript_doc,
+            cfg,
+        )
+        transcript_doc["analysis"] = {
+            "model": cfg.analysis_model,
+            "telegram_message": telegram_message,
+            "generated_at": now_iso(),
+        }
+        transcript_doc["stage"] = "analyzed"
+        transcript_doc["status"] = "analyzed"
+        remote_upload_json(cfg, remote_json_path, transcript_doc)
+
+        logging.info("Sending Telegram message: %s", remote_audio_path)
+        telegram_results = send_telegram_message(cfg, telegram_message)
+        transcript_doc["telegram"] = {
+            "sent": True,
+            "parts_sent": len(telegram_results),
+            "message_ids": [
+                item.get("result", {}).get("message_id") for item in telegram_results
+            ],
+            "updated_at": now_iso(),
+        }
+        transcript_doc["stage"] = "done"
+        transcript_doc["status"] = "ok"
+        remote_upload_json(cfg, remote_json_path, transcript_doc)
+
+        entry["stage"] = "done"
+        entry["processed_sig"] = entry.get("last_sig")
+        entry["last_finished_at"] = now_iso()
+        save_state(cfg.state_path, state)
+        try:
+            remote_archive_or_delete(cfg, remote_audio_path)
+        except Exception:
+            logging.exception(
+                "Could not archive/delete remote audio after success: %s",
+                remote_audio_path,
+            )
+        logging.info("Done: %s", remote_audio_path)
     except Exception as exc:
         error_details = describe_processing_error(
             exc,
@@ -2618,6 +2903,7 @@ def process_remote_audio(
         save_state(cfg.state_path, state)
         error_doc = transcript_doc or build_error_document(remote_file, error_details)
         error_doc["stage"] = "error"
+        error_doc["status"] = "error"
         error_doc["error"] = error_details
         if error_doc.get("telegram") is None:
             error_doc["telegram"] = {
@@ -2669,15 +2955,39 @@ def should_process_file(
         audio_modify = parse_ftp_modify(remote_file.get("modify"))
         json_modify = parse_ftp_modify(remote_json_meta.get("modify"))
         if json_modify is None or audio_modify is None or json_modify >= audio_modify:
-            entry["stage"] = "done"
-            entry["processed_sig"] = current_sig
-            entry["last_finished_at"] = now_iso()
-            entry["skip_reason"] = "json already exists on ftp"
-            logging.info(
-                "Skipping audio because JSON already exists on FTP: %s",
+            saved_remote_doc: Optional[Dict[str, Any]] = None
+            try:
+                saved_remote_doc = remote_load_json(cfg, remote_json_path)
+            except Exception:
+                logging.exception(
+                    "Could not inspect existing remote JSON while deciding retry/skip: %s",
+                    remote_json_path,
+                )
+
+            existing_json_state = classify_saved_remote_json(
+                saved_remote_doc,
                 remote_audio_path,
             )
-            return False
+            if existing_json_state == "completed":
+                entry["stage"] = "done"
+                entry["processed_sig"] = current_sig
+                entry["last_finished_at"] = now_iso()
+                entry["skip_reason"] = "remote json already completed"
+                logging.info(
+                    "Skipping audio because remote JSON already represents a completed result: %s",
+                    remote_audio_path,
+                )
+                return False
+
+            if existing_json_state in {
+                "retry_telegram",
+                "resume_from_transcription",
+                "retry",
+            }:
+                logging.info(
+                    "Existing remote JSON is incomplete or retryable; processing again: %s",
+                    remote_audio_path,
+                )
 
     if int(remote_file["size"]) < cfg.min_audio_bytes:
         reason = f"audio file smaller than {cfg.min_audio_bytes} bytes"
