@@ -117,6 +117,18 @@ def normalize_remote_path(path: str) -> str:
     return normalized
 
 
+def normalize_remote_roots(paths: List[str]) -> List[str]:
+    seen = set()
+    result: List[str] = []
+    for path in paths:
+        normalized = normalize_remote_path(path)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result or ["/"]
+
+
 def model_supports_reasoning_effort(model: str) -> bool:
     normalized = (model or "").strip().lower()
     return normalized.startswith("gpt-5") or normalized.startswith("o")
@@ -150,14 +162,42 @@ def remote_path_is_within(path: str, directory: str) -> bool:
     )
 
 
+def resolve_remote_root_for_path(cfg: "Config", remote_path: str) -> str:
+    normalized_path = normalize_remote_path(remote_path)
+    matching_roots = [
+        root
+        for root in cfg.ftp_remote_roots
+        if remote_path_is_within(normalized_path, root)
+    ]
+    if not matching_roots:
+        return normalize_remote_path(cfg.ftp_remote_root)
+    return max(matching_roots, key=len)
+
+
+def resolve_archive_dir_for_path(cfg: "Config", remote_path: str) -> str:
+    if cfg.ftp_archive_dir_explicit:
+        return normalize_remote_path(cfg.ftp_archive_dir)
+    return join_remote_path(resolve_remote_root_for_path(cfg, remote_path), "archive")
+
+
+def iter_scan_archive_dirs(cfg: "Config") -> List[str]:
+    if cfg.ftp_archive_dir_explicit:
+        return [normalize_remote_path(cfg.ftp_archive_dir)]
+    return normalize_remote_roots(
+        [join_remote_path(root, "archive") for root in cfg.ftp_remote_roots]
+    )
+
+
 def should_skip_remote_scan_path(cfg: "Config", remote_path: str) -> bool:
     if not cfg.ftp_move_to_archive_after_success:
         return False
-    archive_dir = normalize_remote_path(cfg.ftp_archive_dir)
-    remote_root = normalize_remote_path(cfg.ftp_remote_root)
-    if archive_dir == remote_root:
-        return False
-    return remote_path_is_within(remote_path, archive_dir)
+    remote_roots = {normalize_remote_path(root) for root in cfg.ftp_remote_roots}
+    for archive_dir in iter_scan_archive_dirs(cfg):
+        if archive_dir in remote_roots:
+            continue
+        if remote_path_is_within(remote_path, archive_dir):
+            return True
+    return False
 
 
 def parse_ftp_modify(raw: Optional[str]) -> Optional[datetime]:
@@ -415,7 +455,9 @@ class Config:
     ftp_encoding: str
     ftp_encoding_fallbacks: List[str]
     ftp_remote_root: str
+    ftp_remote_roots: List[str]
     ftp_archive_dir: str
+    ftp_archive_dir_explicit: bool
     ftp_delete_after_success: bool
     ftp_move_to_archive_after_success: bool
     ftp_use_tls: bool
@@ -468,20 +510,21 @@ class Config:
             or os.getenv("FTP_USERNAME")
             or ""
         ).strip()
-        ftp_remote_root = normalize_remote_path(
-            (
-                os.getenv("FTP_REMOTE_ROOT")
-                or os.getenv("FTP_REMOTE_DIR")
+        ftp_remote_roots = normalize_remote_roots(
+            env_csv("FTP_REMOTE_ROOTS")
+            or [
+                (
+                    os.getenv("FTP_REMOTE_ROOT")
+                    or os.getenv("FTP_REMOTE_DIR")
+                    or "/"
+                ).strip()
                 or "/"
-            ).strip()
-            or "/"
+            ]
         )
+        ftp_remote_root = ftp_remote_roots[0]
+        ftp_archive_dir_raw = (os.getenv("FTP_ARCHIVE_DIR") or "").strip()
         ftp_archive_dir = normalize_remote_path(
-            (
-                os.getenv("FTP_ARCHIVE_DIR")
-                or join_remote_path(ftp_remote_root, "archive")
-            ).strip()
-            or join_remote_path(ftp_remote_root, "archive")
+            ftp_archive_dir_raw or join_remote_path(ftp_remote_root, "archive")
         )
         transcribe_model = os.getenv(
             "OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe-diarize"
@@ -503,7 +546,9 @@ class Config:
                 "cp1251,cp866,latin-1",
             ),
             ftp_remote_root=ftp_remote_root,
+            ftp_remote_roots=ftp_remote_roots,
             ftp_archive_dir=ftp_archive_dir,
+            ftp_archive_dir_explicit=bool(ftp_archive_dir_raw),
             ftp_delete_after_success=env_bool("FTP_DELETE_AFTER_SUCCESS", False),
             ftp_move_to_archive_after_success=env_bool(
                 "FTP_MOVE_TO_ARCHIVE_AFTER_SUCCESS", False
@@ -1403,15 +1448,32 @@ def iter_ftp_encodings(cfg: Config) -> List[str]:
     return result
 
 
+def dedupe_remote_files(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen_paths = set()
+    result: List[Dict[str, Any]] = []
+    for item in sorted(files, key=lambda entry: entry["path"]):
+        remote_path = item["path"]
+        if remote_path in seen_paths:
+            continue
+        seen_paths.add(remote_path)
+        result.append(item)
+    return result
+
+
 def remote_walk(cfg: Config) -> List[Dict[str, Any]]:
     if cfg.ftp_protocol == "sftp":
-        return sftp_walk(cfg, cfg.ftp_remote_root)
+        files: List[Dict[str, Any]] = []
+        for root in cfg.ftp_remote_roots:
+            files.extend(sftp_walk(cfg, root))
+        return dedupe_remote_files(files)
 
     decode_errors: List[UnicodeDecodeError] = []
     for encoding in iter_ftp_encodings(cfg):
         try:
             with closing(ftp_connect(cfg, encoding=encoding)) as ftp:
-                files = ftp_walk(ftp, cfg.ftp_remote_root, cfg)
+                files: List[Dict[str, Any]] = []
+                for root in cfg.ftp_remote_roots:
+                    files.extend(ftp_walk(ftp, root, cfg))
             if encoding.lower() != cfg.ftp_encoding.lower():
                 logging.warning(
                     "FTP listing is not valid %s; switched runtime encoding to %s. "
@@ -1421,7 +1483,7 @@ def remote_walk(cfg: Config) -> List[Dict[str, Any]]:
                     encoding,
                 )
                 cfg.ftp_encoding = encoding
-            return files
+            return dedupe_remote_files(files)
         except UnicodeDecodeError as exc:
             decode_errors.append(exc)
             logging.warning(
@@ -1457,18 +1519,19 @@ def remote_load_json(cfg: Config, remote_path: str) -> Optional[Dict[str, Any]]:
 
 def remote_archive_or_delete(cfg: Config, remote_path: str) -> None:
     if cfg.ftp_move_to_archive_after_success:
+        archive_dir = resolve_archive_dir_for_path(cfg, remote_path)
         destination_name = posixpath.basename(remote_path)
-        destination_path = join_remote_path(cfg.ftp_archive_dir, destination_name)
+        destination_path = join_remote_path(archive_dir, destination_name)
         if cfg.ftp_protocol == "sftp":
             transport, sftp = sftp_connect(cfg)
             try:
-                ensure_sftp_dir(sftp, cfg.ftp_archive_dir)
+                ensure_sftp_dir(sftp, archive_dir)
                 try:
                     sftp.rename(remote_path, destination_path)
                 except OSError:
                     stem, suffix = posixpath.splitext(destination_name)
                     destination_path = join_remote_path(
-                        cfg.ftp_archive_dir,
+                        archive_dir,
                         f"{stem}__{int(time.time())}{suffix}",
                     )
                     sftp.rename(remote_path, destination_path)
@@ -1480,13 +1543,13 @@ def remote_archive_or_delete(cfg: Config, remote_path: str) -> None:
             return
 
         with closing(ftp_connect(cfg)) as ftp:
-            ensure_ftp_dir(ftp, cfg.ftp_archive_dir)
+            ensure_ftp_dir(ftp, archive_dir)
             try:
                 ftp.rename(remote_path, destination_path)
             except all_errors:
                 stem, suffix = posixpath.splitext(destination_name)
                 destination_path = join_remote_path(
-                    cfg.ftp_archive_dir,
+                    archive_dir,
                     f"{stem}__{int(time.time())}{suffix}",
                 )
                 ftp.rename(remote_path, destination_path)
@@ -2771,10 +2834,10 @@ def main() -> None:
         state = load_state(cfg.state_path)
 
         logging.info(
-            "Daemon started. Poll interval: %s sec. Protocol: %s. Remote root: %s",
+            "Daemon started. Poll interval: %s sec. Protocol: %s. Remote roots: %s",
             cfg.poll_interval_sec,
             cfg.ftp_protocol,
-            cfg.ftp_remote_root,
+            ", ".join(cfg.ftp_remote_roots),
         )
         while True:
             try:

@@ -108,6 +108,9 @@ FTP_USER=ftpuser
 FTP_USERNAME=ftpuser
 FTP_PASSWORD=change-me
 FTP_REMOTE_ROOT=/recordings
+# Если нужно сканировать несколько папок:
+# FTP_REMOTE_ROOTS=/recordings/sales,/recordings/support
+# Если нужен отдельный archive внутри каждой папки, оставьте FTP_ARCHIVE_DIR пустым
 FTP_ARCHIVE_DIR=/recordings/archive
 FTP_DELETE_AFTER_SUCCESS=0
 FTP_MOVE_TO_ARCHIVE_AFTER_SUCCESS=0
@@ -142,6 +145,10 @@ PART_EXPORT_CHANNELS=1
 MAX_API_FILE_SIZE_BYTES=26214400
 LOG_LEVEL=INFO
 ```
+
+Для обычного сценария достаточно `FTP_REMOTE_ROOT`. Если нужно сканировать несколько удаленных каталогов, используйте `FTP_REMOTE_ROOTS` и перечислите пути через запятую.
+
+Если `FTP_ARCHIVE_DIR` указан явно, все файлы будут переноситься в общий архив. Если параметр не задан и включен `FTP_MOVE_TO_ARCHIVE_AFTER_SUCCESS=1`, сервис будет использовать каталог `archive` внутри каждого корня.
 
 ### Если нужен архив исходных файлов
 

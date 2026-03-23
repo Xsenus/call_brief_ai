@@ -182,6 +182,9 @@ FTP_USER=ftpuser
 FTP_USERNAME=ftpuser
 FTP_PASSWORD=change-me
 FTP_REMOTE_ROOT=/recordings
+# Если нужно сканировать несколько папок:
+# FTP_REMOTE_ROOTS=/recordings/sales,/recordings/support
+# Если нужен отдельный archive внутри каждой папки, оставьте FTP_ARCHIVE_DIR пустым
 FTP_ARCHIVE_DIR=/recordings/archive
 FTP_DELETE_AFTER_SUCCESS=0
 FTP_MOVE_TO_ARCHIVE_AFTER_SUCCESS=0
@@ -216,6 +219,10 @@ PART_EXPORT_CHANNELS=1
 MAX_API_FILE_SIZE_BYTES=26214400
 LOG_LEVEL=INFO
 ```
+
+Для одной папки используйте `FTP_REMOTE_ROOT`. Если нужно несколько корней, задайте `FTP_REMOTE_ROOTS` через запятую, например `FTP_REMOTE_ROOTS=/recordings/sales,/recordings/support`.
+
+Если `FTP_ARCHIVE_DIR` задан, все успешно обработанные файлы будут переноситься в этот общий архив. Если `FTP_ARCHIVE_DIR` не задан и включен `FTP_MOVE_TO_ARCHIVE_AFTER_SUCCESS=1`, daemon будет использовать `archive` внутри каждого корня, то есть `/recordings/sales/archive`, `/recordings/support/archive` и так далее.
 
 Если хотите переносить исходные записи в архив после успеха:
 

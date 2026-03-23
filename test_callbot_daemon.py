@@ -17,7 +17,9 @@ def make_config(**overrides):
         "ftp_encoding": "utf-8",
         "ftp_encoding_fallbacks": ["cp1251"],
         "ftp_remote_root": "/recordings",
+        "ftp_remote_roots": ["/recordings"],
         "ftp_archive_dir": "/recordings/archive",
+        "ftp_archive_dir_explicit": True,
         "ftp_delete_after_success": False,
         "ftp_move_to_archive_after_success": True,
         "ftp_use_tls": False,
@@ -63,6 +65,8 @@ def make_config(**overrides):
         "max_transcribe_bytes": 26214400,
     }
     data.update(overrides)
+    if "ftp_remote_roots" not in overrides:
+        data["ftp_remote_roots"] = [data["ftp_remote_root"]]
     return daemon.Config(**data)
 
 
@@ -399,7 +403,31 @@ class ConfigDefaultsTests(unittest.TestCase):
             cfg = daemon.Config.from_env()
 
         self.assertEqual(cfg.poll_interval_sec, 60)
+        self.assertEqual(cfg.ftp_remote_roots, ["/recordings"])
         self.assertEqual(cfg.ftp_archive_dir, "/recordings/archive")
+        self.assertFalse(cfg.ftp_archive_dir_explicit)
+
+    def test_from_env_supports_multiple_remote_roots(self):
+        env = {
+            "OPENAI_API_KEY": "sk-test",
+            "FTP_HOST": "example.com",
+            "FTP_USER": "user",
+            "FTP_PASSWORD": "pass",
+            "TELEGRAM_BOT_TOKEN": "123:test",
+            "TELEGRAM_CHAT_ID": "-1001",
+            "FTP_REMOTE_ROOTS": "/recordings/sales, /recordings/support, /recordings/sales",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=True):
+            cfg = daemon.Config.from_env()
+
+        self.assertEqual(
+            cfg.ftp_remote_roots,
+            ["/recordings/sales", "/recordings/support"],
+        )
+        self.assertEqual(cfg.ftp_remote_root, "/recordings/sales")
+        self.assertEqual(cfg.ftp_archive_dir, "/recordings/sales/archive")
+        self.assertFalse(cfg.ftp_archive_dir_explicit)
 
 
 class RemoteScanExclusionTests(unittest.TestCase):
@@ -437,6 +465,109 @@ class RemoteScanExclusionTests(unittest.TestCase):
             daemon.should_skip_remote_scan_path(
                 cfg, "/recordings/call.mp3"
             )
+        )
+
+    def test_skips_implicit_archive_dirs_for_each_remote_root(self):
+        cfg = make_config(
+            ftp_remote_root="/recordings/sales",
+            ftp_remote_roots=["/recordings/sales", "/recordings/support"],
+            ftp_archive_dir="/recordings/sales/archive",
+            ftp_archive_dir_explicit=False,
+            ftp_move_to_archive_after_success=True,
+        )
+
+        self.assertTrue(
+            daemon.should_skip_remote_scan_path(
+                cfg, "/recordings/support/archive/call.mp3"
+            )
+        )
+        self.assertFalse(
+            daemon.should_skip_remote_scan_path(
+                cfg, "/recordings/support/call.mp3"
+            )
+        )
+
+
+class ArchiveResolutionTests(unittest.TestCase):
+    def test_resolves_archive_dir_from_matching_remote_root(self):
+        cfg = make_config(
+            ftp_remote_root="/recordings/sales",
+            ftp_remote_roots=["/recordings/sales", "/recordings/support"],
+            ftp_archive_dir="/recordings/sales/archive",
+            ftp_archive_dir_explicit=False,
+        )
+
+        self.assertEqual(
+            daemon.resolve_archive_dir_for_path(
+                cfg, "/recordings/support/2026/call.mp3"
+            ),
+            "/recordings/support/archive",
+        )
+
+    def test_explicit_archive_dir_is_shared_for_all_roots(self):
+        cfg = make_config(
+            ftp_remote_root="/recordings/sales",
+            ftp_remote_roots=["/recordings/sales", "/recordings/support"],
+            ftp_archive_dir="/archive/common",
+            ftp_archive_dir_explicit=True,
+        )
+
+        self.assertEqual(
+            daemon.resolve_archive_dir_for_path(
+                cfg, "/recordings/support/2026/call.mp3"
+            ),
+            "/archive/common",
+        )
+
+
+class RemoteWalkTests(unittest.TestCase):
+    def test_sftp_remote_walk_scans_all_roots_and_deduplicates(self):
+        cfg = make_config(
+            ftp_protocol="sftp",
+            ftp_remote_root="/recordings",
+            ftp_remote_roots=["/recordings", "/recordings/nested"],
+        )
+
+        root_results = {
+            "/recordings": [
+                {
+                    "path": "/recordings/a.mp3",
+                    "name": "a.mp3",
+                    "size": 1,
+                    "modify": "20260323070000",
+                },
+                {
+                    "path": "/recordings/nested/b.mp3",
+                    "name": "b.mp3",
+                    "size": 2,
+                    "modify": "20260323070100",
+                },
+            ],
+            "/recordings/nested": [
+                {
+                    "path": "/recordings/nested/b.mp3",
+                    "name": "b.mp3",
+                    "size": 2,
+                    "modify": "20260323070100",
+                }
+            ],
+        }
+
+        with mock.patch(
+            "callbot_daemon.sftp_walk",
+            side_effect=lambda cfg_arg, root: root_results[root],
+        ) as mocked_walk:
+            files = daemon.remote_walk(cfg)
+
+        self.assertEqual(
+            [item["path"] for item in files],
+            ["/recordings/a.mp3", "/recordings/nested/b.mp3"],
+        )
+        mocked_walk.assert_has_calls(
+            [
+                mock.call(cfg, "/recordings"),
+                mock.call(cfg, "/recordings/nested"),
+            ]
         )
 
 
