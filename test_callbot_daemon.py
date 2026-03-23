@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 from unittest import mock
+import tempfile
 
 import callbot_daemon as daemon
 
@@ -112,6 +113,34 @@ class InspectResponseOutputTests(unittest.TestCase):
         self.assertEqual(info["text"], "")
         self.assertEqual(info["refusal"], "Не могу помочь с этим.")
 
+    def test_extract_saved_telegram_message_uses_existing_analysis(self):
+        transcript_doc = {
+            "source": {"ftp_path_audio": "/recordings/call.mp3"},
+            "analysis": {"telegram_message": "Готовое сообщение"},
+            "telegram": {"sent": False},
+        }
+
+        message = daemon.extract_saved_telegram_message(
+            transcript_doc,
+            "/recordings/call.mp3",
+        )
+
+        self.assertEqual(message, "Готовое сообщение")
+
+    def test_extract_saved_telegram_message_skips_already_sent(self):
+        transcript_doc = {
+            "source": {"ftp_path_audio": "/recordings/call.mp3"},
+            "analysis": {"telegram_message": "Готовое сообщение"},
+            "telegram": {"sent": True},
+        }
+
+        message = daemon.extract_saved_telegram_message(
+            transcript_doc,
+            "/recordings/call.mp3",
+        )
+
+        self.assertEqual(message, "")
+
 
 class AnalysisRetryTests(unittest.TestCase):
     def test_builds_retry_settings_for_token_exhaustion(self):
@@ -205,6 +234,82 @@ class AnalysisRetryTests(unittest.TestCase):
                 )
 
         self.assertIn("returned a refusal", str(exc_info.exception))
+
+
+class TelegramTests(unittest.TestCase):
+    def test_send_telegram_message_includes_api_description(self):
+        cfg = make_config()
+        response = mock.Mock()
+        response.status_code = 400
+        response.reason = "Bad Request"
+        response.text = '{"ok":false,"description":"Bad Request: message thread not found"}'
+        response.json.return_value = {
+            "ok": False,
+            "error_code": 400,
+            "description": "Bad Request: message thread not found",
+        }
+
+        with mock.patch("callbot_daemon.requests.post", return_value=response):
+            with self.assertRaises(RuntimeError) as exc_info:
+                daemon.send_telegram_message(cfg, "Тест")
+
+        self.assertIn("message thread not found", str(exc_info.exception))
+
+    def test_process_remote_audio_reuses_saved_analysis_for_telegram_retry(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cfg = make_config(
+                state_path=Path(temp_dir) / "state.json",
+                work_root=Path(temp_dir),
+            )
+            state = {"files": {}}
+            remote_file = {
+                "path": "/recordings/call.mp3",
+                "name": "call.mp3",
+                "size": 123456,
+                "modify": "20260323070000",
+            }
+            saved_doc = {
+                "generated_at": "2026-03-23T00:00:00+00:00",
+                "stage": "error",
+                "source": {"ftp_path_audio": "/recordings/call.mp3"},
+                "analysis": {"telegram_message": "Готовое сообщение"},
+                "telegram": {"sent": False, "reason": "processing failed"},
+            }
+
+            with (
+                mock.patch("callbot_daemon.remote_load_json", return_value=saved_doc),
+                mock.patch(
+                    "callbot_daemon.send_telegram_message",
+                    return_value=[{"result": {"message_id": 101}}],
+                ) as mocked_send,
+                mock.patch("callbot_daemon.remote_upload_json") as mocked_upload,
+                mock.patch("callbot_daemon.remote_archive_or_delete") as mocked_archive,
+                mock.patch("callbot_daemon.remote_download_file") as mocked_download,
+                mock.patch("callbot_daemon.prepare_audio_parts") as mocked_prepare,
+                mock.patch("callbot_daemon.transcribe_part") as mocked_transcribe,
+                mock.patch("callbot_daemon.analyze_transcript") as mocked_analyze,
+            ):
+                daemon.process_remote_audio(
+                    cfg=cfg,
+                    client=mock.Mock(),
+                    instruction_text="Инструкция",
+                    state=state,
+                    remote_file=remote_file,
+                )
+
+            mocked_send.assert_called_once_with(cfg, "Готовое сообщение")
+            mocked_upload.assert_called_once()
+            mocked_archive.assert_called_once_with(cfg, "/recordings/call.mp3")
+            mocked_download.assert_not_called()
+            mocked_prepare.assert_not_called()
+            mocked_transcribe.assert_not_called()
+            mocked_analyze.assert_not_called()
+            self.assertEqual(
+                state["files"]["/recordings/call.mp3"]["stage"],
+                "done",
+            )
+            self.assertEqual(saved_doc["telegram"]["sent"], True)
+            self.assertEqual(saved_doc["stage"], "done")
 
 
 class AnalysisDefaultsTests(unittest.TestCase):

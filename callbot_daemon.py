@@ -849,6 +849,18 @@ def load_instruction_text(path: Path) -> str:
     return raw.strip()
 
 
+def parse_json_text(raw: str, source_name: str) -> Optional[Dict[str, Any]]:
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        logging.exception("Could not parse JSON from %s", source_name)
+        return None
+    if not isinstance(obj, dict):
+        logging.warning("JSON root is not an object in %s", source_name)
+        return None
+    return obj
+
+
 class RemoteConnectionError(RuntimeError):
     pass
 
@@ -929,6 +941,24 @@ def ftp_download_file(cfg: Config, remote_path: str, local_path: Path) -> None:
     ensure_parent_dir(local_path)
     with closing(ftp_connect(cfg)) as ftp, local_path.open("wb") as out:
         ftp.retrbinary(f"RETR {remote_path}", out.write)
+
+
+def ftp_load_json(cfg: Config, remote_path: str) -> Optional[Dict[str, Any]]:
+    buffer = io.BytesIO()
+    try:
+        with closing(ftp_connect(cfg)) as ftp:
+            ftp.retrbinary(f"RETR {remote_path}", buffer.write)
+    except error_perm as exc:
+        if str(exc).startswith("550"):
+            return None
+        raise
+
+    try:
+        raw = buffer.getvalue().decode("utf-8")
+    except UnicodeDecodeError:
+        logging.exception("Could not decode remote JSON as UTF-8: %s", remote_path)
+        return None
+    return parse_json_text(raw, remote_path)
 
 
 def ftp_upload_json(cfg: Config, remote_path: str, payload: Dict[str, Any]) -> None:
@@ -1034,6 +1064,29 @@ def sftp_download_file(cfg: Config, remote_path: str, local_path: Path) -> None:
             sftp.close()
         finally:
             transport.close()
+
+
+def sftp_load_json(cfg: Config, remote_path: str) -> Optional[Dict[str, Any]]:
+    transport, sftp = sftp_connect(cfg)
+    try:
+        try:
+            with sftp.open(remote_path, "r") as remote_file:
+                raw = remote_file.read()
+        except FileNotFoundError:
+            return None
+    finally:
+        try:
+            sftp.close()
+        finally:
+            transport.close()
+
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            logging.exception("Could not decode remote JSON as UTF-8: %s", remote_path)
+            return None
+    return parse_json_text(str(raw), remote_path)
 
 
 def sftp_upload_json(cfg: Config, remote_path: str, payload: Dict[str, Any]) -> None:
@@ -1253,6 +1306,12 @@ def remote_upload_json(cfg: Config, remote_path: str, payload: Dict[str, Any]) -
         sftp_upload_json(cfg, remote_path, payload)
         return
     ftp_upload_json(cfg, remote_path, payload)
+
+
+def remote_load_json(cfg: Config, remote_path: str) -> Optional[Dict[str, Any]]:
+    if cfg.ftp_protocol == "sftp":
+        return sftp_load_json(cfg, remote_path)
+    return ftp_load_json(cfg, remote_path)
 
 
 def remote_archive_or_delete(cfg: Config, remote_path: str) -> None:
@@ -2018,6 +2077,69 @@ def split_text_for_telegram(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> List
     return parts
 
 
+def describe_telegram_failure(
+    response: requests.Response,
+    piece_index: int,
+    pieces_total: int,
+    payload: Dict[str, Any],
+) -> str:
+    response_text = (response.text or "").strip()
+    description = ""
+    parameters: Any = None
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        description = str(data.get("description") or "").strip()
+        parameters = data.get("parameters")
+
+    parts = [
+        f"Telegram sendMessage failed with HTTP {response.status_code}",
+        f"piece {piece_index}/{pieces_total}",
+        f"text_length={len(str(payload.get('text') or ''))}",
+    ]
+    if payload.get("message_thread_id") is not None:
+        parts.append(f"thread_id={payload['message_thread_id']}")
+    message = " (" + ", ".join(parts[1:]) + ")"
+    message = parts[0] + message
+    if description:
+        message += f": {description}"
+    elif response.reason:
+        message += f": {response.reason}"
+    if parameters:
+        message += f" | parameters={json.dumps(parameters, ensure_ascii=False)}"
+    if not description and response_text:
+        message += f" | body={response_text[:500]}"
+    return message
+
+
+def extract_saved_telegram_message(
+    transcript_doc: Optional[Dict[str, Any]],
+    remote_audio_path: str,
+) -> str:
+    if not isinstance(transcript_doc, dict):
+        return ""
+
+    source = transcript_doc.get("source")
+    if not isinstance(source, dict):
+        return ""
+    if str(source.get("ftp_path_audio") or "").strip() != remote_audio_path:
+        return ""
+
+    telegram = transcript_doc.get("telegram")
+    if isinstance(telegram, dict) and telegram.get("sent") is True:
+        return ""
+
+    analysis = transcript_doc.get("analysis")
+    if not isinstance(analysis, dict):
+        return ""
+    message = analysis.get("telegram_message")
+    if not isinstance(message, str):
+        return ""
+    return message.strip()
+
+
 def send_telegram_message(cfg: Config, text: str) -> List[Dict[str, Any]]:
     url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage"
     pieces = split_text_for_telegram(text)
@@ -2033,10 +2155,23 @@ def send_telegram_message(cfg: Config, text: str) -> List[Dict[str, Any]]:
         if cfg.telegram_message_thread_id is not None:
             payload["message_thread_id"] = cfg.telegram_message_thread_id
         response = requests.post(url, json=payload, timeout=60, proxies=proxies)
-        response.raise_for_status()
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError:
+            data = None
+        if response.status_code >= 400:
+            raise RuntimeError(
+                describe_telegram_failure(response, index, len(pieces), payload)
+            )
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                "Telegram sendMessage returned a non-JSON response "
+                f"(piece {index}/{len(pieces)})"
+            )
         if not data.get("ok"):
-            raise RuntimeError(f"Telegram sendMessage failed: {data}")
+            raise RuntimeError(
+                describe_telegram_failure(response, index, len(pieces), payload)
+            )
         results.append(data)
 
     return results
@@ -2076,6 +2211,43 @@ def process_remote_audio(
 
     transcript_doc: Optional[Dict[str, Any]] = None
     try:
+        transcript_doc = remote_load_json(cfg, remote_json_path)
+        reusable_telegram_message = extract_saved_telegram_message(
+            transcript_doc,
+            remote_audio_path,
+        )
+        if reusable_telegram_message:
+            logging.info(
+                "Reusing saved analysis and retrying Telegram only: %s",
+                remote_audio_path,
+            )
+            logging.info("Sending Telegram message: %s", remote_audio_path)
+            telegram_results = send_telegram_message(cfg, reusable_telegram_message)
+            transcript_doc["telegram"] = {
+                "sent": True,
+                "parts_sent": len(telegram_results),
+                "message_ids": [
+                    item.get("result", {}).get("message_id") for item in telegram_results
+                ],
+                "updated_at": now_iso(),
+            }
+            transcript_doc["stage"] = "done"
+            remote_upload_json(cfg, remote_json_path, transcript_doc)
+
+            entry["stage"] = "done"
+            entry["processed_sig"] = entry.get("last_sig")
+            entry["last_finished_at"] = now_iso()
+            save_state(cfg.state_path, state)
+            try:
+                remote_archive_or_delete(cfg, remote_audio_path)
+            except Exception:
+                logging.exception(
+                    "Could not archive/delete remote audio after Telegram retry success: %s",
+                    remote_audio_path,
+                )
+            logging.info("Done after Telegram retry: %s", remote_audio_path)
+            return
+
         with tempfile.TemporaryDirectory(dir=cfg.work_root) as tmp_dir_name:
             tmp_dir = Path(tmp_dir_name)
             local_audio = tmp_dir / remote_file["name"]
