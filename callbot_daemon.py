@@ -357,6 +357,21 @@ class Config:
             or os.getenv("FTP_USERNAME")
             or ""
         ).strip()
+        ftp_remote_root = normalize_remote_path(
+            (
+                os.getenv("FTP_REMOTE_ROOT")
+                or os.getenv("FTP_REMOTE_DIR")
+                or "/"
+            ).strip()
+            or "/"
+        )
+        ftp_archive_dir = normalize_remote_path(
+            (
+                os.getenv("FTP_ARCHIVE_DIR")
+                or join_remote_path(ftp_remote_root, "archive")
+            ).strip()
+            or join_remote_path(ftp_remote_root, "archive")
+        )
         transcribe_model = os.getenv(
             "OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe-diarize"
         ).strip()
@@ -376,17 +391,8 @@ class Config:
                 "FTP_ENCODING_FALLBACKS",
                 "cp1251,cp866,latin-1",
             ),
-            ftp_remote_root=normalize_remote_path(
-                (
-                    os.getenv("FTP_REMOTE_ROOT")
-                    or os.getenv("FTP_REMOTE_DIR")
-                    or "/"
-                ).strip()
-                or "/"
-            ),
-            ftp_archive_dir=normalize_remote_path(
-                os.getenv("FTP_ARCHIVE_DIR", "/archive").strip() or "/archive"
-            ),
+            ftp_remote_root=ftp_remote_root,
+            ftp_archive_dir=ftp_archive_dir,
             ftp_delete_after_success=env_bool("FTP_DELETE_AFTER_SUCCESS", False),
             ftp_move_to_archive_after_success=env_bool(
                 "FTP_MOVE_TO_ARCHIVE_AFTER_SUCCESS", False
@@ -510,7 +516,7 @@ class Config:
             telegram_chat_id=os.environ["TELEGRAM_CHAT_ID"],
             telegram_message_thread_id=env_optional_int("TELEGRAM_MESSAGE_THREAD_ID"),
             telegram_proxy=os.getenv("TELEGRAM_PROXY", "").strip(),
-            poll_interval_sec=int(os.getenv("POLL_INTERVAL_SEC", "300")),
+            poll_interval_sec=int(os.getenv("POLL_INTERVAL_SEC", "60")),
             min_stable_polls=int(os.getenv("MIN_STABLE_POLLS", "2")),
             min_audio_bytes=int(os.getenv("MIN_AUDIO_BYTES", str(100 * 1024))),
             min_dialogue_words=int(os.getenv("MIN_DIALOGUE_WORDS", "30")),

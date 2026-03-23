@@ -1,212 +1,332 @@
 # Call Brief AI
 
-Python-сервис для VPS, который:
+`Call Brief AI` — это production-сервис для VPS, который забирает записи разговоров с FTP или SFTP, делает транскрибацию через OpenAI, формирует итоговое сообщение и отправляет его в Telegram.
 
-1. Сканирует FTP или SFTP каждые 5 минут.
-2. Забирает новые аудиофайлы разговоров.
-3. Нормализует аудио через `ffmpeg`.
-4. Если файл крупнее 4 МБ, режет его на MP3-части не больше 4 МБ.
-5. Отправляет каждую часть в OpenAI на транскрибацию с диаризацией.
-6. Объединяет части в единый JSON разговора.
-7. Передает JSON разговора и `instructions.json` в OpenAI Responses API.
-8. Получает готовое сообщение для Telegram и отправляет его в группу от имени бота.
-9. Сохраняет `.json` рядом с исходным аудиофайлом на удаленном хранилище.
-10. Может после успешной обработки перенести исходный файл в архив или удалить его.
+## Что делает сервис
+
+1. Сканирует удаленное хранилище с интервалом `POLL_INTERVAL_SEC`.
+2. Ждет `MIN_STABLE_POLLS` стабильных проходов, чтобы не брать файл, который еще догружается.
+3. Скачивает аудио и нормализует его через `ffmpeg`.
+4. При необходимости режет файл на части по `TARGET_PART_MAX_BYTES`.
+5. Отправляет части в OpenAI на транскрибацию с diarization.
+6. Собирает единый JSON разговора и сохраняет его рядом с аудио на FTP/SFTP.
+7. Отправляет JSON разговора в OpenAI Responses API и получает готовый текст для Telegram.
+8. Публикует сообщение в Telegram от имени бота.
+9. По настройке оставляет исходный файл, переносит его в архив или удаляет.
+
+## Как устроен цикл обработки
+
+Для файла `/recordings/call_001.mp3` сервис работает так:
+
+1. Находит файл при очередном сканировании удаленного каталога.
+2. Формирует сигнатуру файла из размера и времени модификации.
+3. Если файл не менялся в течение нужного количества проходов, берет его в работу.
+4. Сохраняет подробный результат в `/recordings/call_001.json`.
+5. Сохраняет служебное состояние локально в `STATE_PATH`.
+6. Если отправка в Telegram уже готова, но в прошлый раз упала, использует сохраненный `analysis.telegram_message` и повторяет только Telegram-шаг без новой транскрибации.
+
+При настройках:
+
+```dotenv
+POLL_INTERVAL_SEC=60
+MIN_STABLE_POLLS=2
+```
+
+новый файл обычно пойдет в обработку на втором стабильном сканировании, то есть примерно через один интервал после первого обнаружения.
+
+Если нужна обработка сразу в том же цикле обнаружения, установите:
+
+```dotenv
+MIN_STABLE_POLLS=1
+```
+
+## Где хранится состояние
+
+Сервис хранит данные в двух местах.
+
+### 1. Локальное служебное состояние
+
+Файл:
+
+```text
+/opt/call_brief_ai/shared/state.json
+```
+
+Там daemon хранит:
+
+- `stage`
+- `last_sig`
+- `processed_sig`
+- `last_started_at`
+- `last_finished_at`
+- `last_error`
+- `skip_reason`
+
+Это нужно для дедупликации, стабильных poll-проходов и повтора после ошибок.
+
+### 2. JSON рядом с аудио на FTP/SFTP
+
+Для файла:
+
+```text
+/recordings/call_001.mp3
+```
+
+создается:
+
+```text
+/recordings/call_001.json
+```
+
+В этом JSON лежит:
+
+- блок `source`
+- блок `transcription`
+- блок `analysis`
+- блок `telegram`
+
+Если рядом с аудио уже лежит одноименный `*.json`, сервис считает запись уже обработанной и заново ее не берет.
+
+## Как заново обработать один звонок
+
+Чтобы принудительно перегнать конкретный файл, нужно удалить оба следа:
+
+1. Запись о файле из `/opt/call_brief_ai/shared/state.json`
+2. Одноименный `*.json` рядом с `*.mp3` на FTP/SFTP
+
+Если удалить только `state.json`, а `*.json` рядом с аудио останется, сервис все равно пропустит файл.
 
 ## Файлы проекта
 
-- `callbot_daemon.py` - основной daemon.
-- `get_telegram_chat_id.py` - helper для получения `TELEGRAM_CHAT_ID`.
-- `.env.example` - шаблон конфигурации.
-- `instructions.json` - инструкция для шага анализа.
-- `callbot.service.example` - шаблон systemd unit.
-
-## Что изменилось по новому запросу
-
-- Добавлена поддержка `SFTP` через `paramiko`.
-- Добавлено разбиение MP3 по порогу 4 МБ.
-- Добавлен порог перехода к анализу не только по словам, но и по длительности.
-- В итоговый JSON добавлены метаданные из имени файла и объединенные сегменты с корректным сдвигом таймингов.
-- Сервис может архивировать или удалять исходный файл после успешной обработки.
-- Поддерживается новый формат `instructions.json`, который может быть как строкой, так и большим JSON-документом.
+- `callbot_daemon.py` — основной daemon
+- `get_telegram_chat_id.py` — helper для получения `TELEGRAM_CHAT_ID`
+- `.env.example` — рабочий шаблон конфигурации
+- `instruction.json` и `instructions.json` — примеры системной инструкции
+- `callbot.service.example` — шаблон systemd unit для ручной установки
+- `deploy/callbot.service` — unit для auto-deploy на VPS
+- `deploy/remote_deploy.sh` — удаленный deploy-скрипт
+- `.github/workflows/deploy.yml` — GitHub Actions workflow
 
 ## Быстрый старт на VPS
 
-### 1. Установите системные зависимости
+### 1. Установите системные пакеты
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y ffmpeg python3 python3-pip python3-venv
+sudo apt-get install -y python3 python3-venv python3-pip ffmpeg git curl nano
 ```
 
-`ffprobe` обычно ставится вместе с `ffmpeg` и тоже нужен сервису.
-
-### 2. Подготовьте проект
+### 2. Подготовьте рабочие каталоги
 
 ```bash
-cd /opt
-sudo mkdir -p call_brief_ai
-sudo chown "$USER":"$USER" call_brief_ai
-cd /opt/call_brief_ai
+sudo mkdir -p /opt/call_brief_ai/shared/work
+sudo mkdir -p /opt/call_brief_ai/shared/logs
+sudo touch /opt/call_brief_ai/shared/.env
+sudo touch /opt/call_brief_ai/shared/instructions.json
+printf '{\n  "files": {}\n}\n' | sudo tee /opt/call_brief_ai/shared/state.json > /dev/null
+```
 
+### 3. Разверните код
+
+Если без GitHub Actions:
+
+```bash
+cd /opt/call_brief_ai
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -U pip
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 3. Заполните `.env`
+Если через auto-deploy, workflow сам создаст release и virtualenv.
+
+### 4. Заполните `.env`
+
+Откройте:
 
 ```bash
-cp .env.example .env
+sudo nano /opt/call_brief_ai/shared/.env
 ```
 
-Минимально нужно заполнить:
+И используйте шаблон из `.env.example`.
 
-- `OPENAI_API_KEY`
-- `FTP_PROTOCOL`
-- `FTP_HOST`
-- `FTP_PORT`
-- `FTP_USER` или `FTP_USERNAME`
-- `FTP_PASSWORD`
-- `FTP_REMOTE_ROOT`
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
+## Пример рабочей конфигурации
 
-Важные настройки:
-
-- `OPENAI_BASE_URL` позволяет отправлять OpenAI-запросы в совместимый gateway вместо стандартного API.
-- `OPENAI_PROXY` задает отдельный HTTP/HTTPS proxy только для OpenAI.
-- `OPENAI_TIMEOUT_SEC=600` задает общий timeout OpenAI-запроса.
-- `OPENAI_CONNECT_TIMEOUT_SEC=30` увеличивает timeout на подключение к proxy/OpenAI, что особенно полезно при `OPENAI_PROXY`.
-- `OPENAI_ROUTE_PROBE_TIMEOUT_SEC=15` и `OPENAI_ROUTE_PROBE_CONNECT_TIMEOUT_SEC=5` задают короткую проверку маршрута перед скачиванием аудио, чтобы быстрее понять, что proxy недоступен.
-- `OPENAI_REQUEST_ATTEMPTS=2`, `OPENAI_RETRY_DELAY_SEC=2` и `OPENAI_RETRY_BACKOFF=2` управляют повтором OpenAI-запросов при временных сетевых сбоях.
-- `OPENAI_PROXY_FAILURE_COOLDOWN_SEC=300` временно останавливает попытки через умерший `OPENAI_PROXY`, чтобы сервис не тратил весь цикл на одинаковые таймауты.
-- `OPENAI_PROXY_DIRECT_FALLBACK=1` разрешает временно уйти на прямой маршрут без proxy, но включайте это только если сам VPS может ходить в OpenAI напрямую и это допустимо по региону.
-- `TELEGRAM_PROXY` задает отдельный HTTP/HTTPS proxy только для Telegram.
-- `FTP_PROTOCOL=sftp` для SFTP, `ftp` для FTP/FTPS.
-- `FTP_USE_TLS=1` актуален только для FTP/FTPS.
-- `FTP_ENCODING` задает кодировку FTP-листинга; для старых серверов с кириллицей часто нужен `cp1251`.
-- `FTP_TIMEOUT_SEC=60` задает timeout одного подключения.
-- `FTP_CONNECT_ATTEMPTS=2` и `FTP_RETRY_DELAY_SEC=5` добавляют повтор подключения, если хранилище временно не отвечает.
-- `SPLIT_THRESHOLD_BYTES=4194304` и `TARGET_PART_MAX_BYTES=4194304` задают разбиение по 4 МБ.
-- `MIN_DURATION_MIN=0.5` не пускает в LLM-анализ слишком короткие звонки.
-- `MIN_DIALOGUE_WORDS=30` отсеивает почти пустые диалоги.
-- `FTP_MOVE_TO_ARCHIVE_AFTER_SUCCESS=1` переносит исходный файл в архив после успеха.
-- `FTP_DELETE_AFTER_SUCCESS=1` удаляет исходный файл после успеха.
-
-Не включайте одновременно архивирование и удаление, если не уверены в сценарии. Обычно достаточно `FTP_MOVE_TO_ARCHIVE_AFTER_SUCCESS=1`.
-
-### Прокси
-
-Если нужно обойти региональные ограничения OpenAI, можно использовать отдельный proxy именно для OpenAI:
+Ниже production-шаблон для FTPS, кодировки `cp1251`, OpenAI proxy и сканирования раз в 60 секунд.
 
 ```dotenv
-OPENAI_PROXY=http://login:password@PROXY_HOST:8888
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=
+OPENAI_PROXY=http://user:password@proxy-host:8889
+OPENAI_TIMEOUT_SEC=600
+OPENAI_CONNECT_TIMEOUT_SEC=30
+OPENAI_ROUTE_PROBE_TIMEOUT_SEC=15
+OPENAI_ROUTE_PROBE_CONNECT_TIMEOUT_SEC=5
+OPENAI_REQUEST_ATTEMPTS=2
+OPENAI_RETRY_DELAY_SEC=2
+OPENAI_RETRY_BACKOFF=2
+OPENAI_PROXY_FAILURE_COOLDOWN_SEC=300
+OPENAI_PROXY_DIRECT_FALLBACK=0
+OPENAI_TRANSCRIBE_MODEL=gpt-4o-transcribe-diarize
+OPENAI_TRANSCRIBE_LANGUAGE=ru
+OPENAI_CHUNKING_STRATEGY=auto
+OPENAI_ANALYSIS_MODEL=gpt-5-mini
+OPENAI_ANALYSIS_REASONING_EFFORT=low
+OPENAI_ANALYSIS_STORE=0
+OPENAI_ANALYSIS_MAX_OUTPUT_TOKENS=1800
+
+FTP_PROTOCOL=ftp
+FTP_HOST=ftp.example.com
+FTP_PORT=21
+FTP_USER=ftpuser
+FTP_USERNAME=ftpuser
+FTP_PASSWORD=change-me
+FTP_REMOTE_ROOT=/recordings
+FTP_ARCHIVE_DIR=/recordings/archive
+FTP_DELETE_AFTER_SUCCESS=0
+FTP_MOVE_TO_ARCHIVE_AFTER_SUCCESS=0
+FTP_USE_TLS=1
+FTP_ENCODING=cp1251
+FTP_ENCODING_FALLBACKS=cp1251,cp866,latin-1
+FTP_TIMEOUT_SEC=120
+FTP_CONNECT_ATTEMPTS=2
+FTP_RETRY_DELAY_SEC=5
+
+INSTRUCTIONS_JSON_PATH=/opt/call_brief_ai/shared/instructions.json
+INSTRUCTION_JSON_PATH=/opt/call_brief_ai/shared/instructions.json
+STATE_PATH=/opt/call_brief_ai/shared/state.json
+WORK_ROOT=/opt/call_brief_ai/shared/work
+
+TELEGRAM_BOT_TOKEN=123456789:ABCDEF...
+TELEGRAM_CHAT_ID=-1001234567890
+TELEGRAM_MESSAGE_THREAD_ID=
+TELEGRAM_PROXY=
+TELEGRAM_DROP_WEBHOOK=0
+
+POLL_INTERVAL_SEC=60
+MIN_STABLE_POLLS=2
+MIN_AUDIO_BYTES=102400
+MIN_DURATION_MIN=0.5
+MIN_DIALOGUE_WORDS=30
+SPLIT_THRESHOLD_BYTES=4194304
+TARGET_PART_MAX_BYTES=4194304
+PART_EXPORT_BITRATE=64k
+PART_EXPORT_FRAME_RATE=16000
+PART_EXPORT_CHANNELS=1
+MAX_API_FILE_SIZE_BYTES=26214400
+LOG_LEVEL=INFO
 ```
 
-Для Telegram можно задать свой proxy:
+Если хотите переносить исходные записи в архив после успеха:
+
+1. Создайте каталог архива на удаленном хранилище, например `/recordings/archive`
+2. Включите:
 
 ```dotenv
-TELEGRAM_PROXY=http://login:password@PROXY_HOST:8888
+FTP_MOVE_TO_ARCHIVE_AFTER_SUCCESS=1
+FTP_ARCHIVE_DIR=/recordings/archive
 ```
 
-Если вы хотите проксировать все HTTP(S)-запросы процесса целиком, вместо отдельных переменных можно использовать стандартные:
+Если архив на FTP не нужен, оставляйте:
 
 ```dotenv
-HTTP_PROXY=http://login:password@PROXY_HOST:8888
-HTTPS_PROXY=http://login:password@PROXY_HOST:8888
-NO_PROXY=127.0.0.1,localhost
+FTP_MOVE_TO_ARCHIVE_AFTER_SUCCESS=0
+FTP_DELETE_AFTER_SUCCESS=0
 ```
 
-Важно: proxy на том же VPS, где уже возникает `403 unsupported_country_region_territory`, проблему не решит. Выходной IP proxy должен быть в поддерживаемой OpenAI стране.
+## Как заполнить `instructions.json`
 
-При `OPENAI_PROXY` сервис использует отдельный `httpx`-клиент без чтения глобальных `HTTP_PROXY` / `HTTPS_PROXY`, чтобы не смешивать маршруты. Если в диагностике видны `CONNECT tunnel failed` или `httpx.ConnectTimeout`, сначала проверьте сам proxy через `curl -x ... https://api.openai.com/v1/models ...`: это обычно означает проблему в proxy/firewall, а не в API-ключе OpenAI.
+Сервис умеет читать инструкцию в двух форматах:
 
-Начиная с текущей версии daemon сам делает управляемые повторы OpenAI-запросов и, если `OPENAI_PROXY` перестал отвечать, ставит proxy-маршрут на паузу на `OPENAI_PROXY_FAILURE_COOLDOWN_SEC`. Перед скачиванием новых аудио он также делает легкую проверку OpenAI-маршрута, чтобы не тратить цикл на загрузку и нормализацию файлов при заведомо мертвом proxy.
+1. Простой текстовый файл
+2. JSON-объект с одним из ключей:
 
-### 4. Подставьте актуальную инструкцию
+- `instructions`
+- `instruction`
+- `prompt`
+- `system_prompt`
+- `system`
+- `text`
 
-Сервис по умолчанию ищет:
+Простой пример:
 
-- `INSTRUCTIONS_JSON_PATH`
-- если ее нет, то `INSTRUCTION_JSON_PATH`
+```json
+{
+  "instructions": "Сформируй короткое сообщение для Telegram на русском языке. Верни только готовый текст сообщения без префиксов и без markdown-кода."
+}
+```
 
-Рекомендуемый путь:
+Файл должен лежать по пути:
+
+```text
+/opt/call_brief_ai/shared/instructions.json
+```
+
+## Как получить `TELEGRAM_CHAT_ID`
+
+1. Добавьте бота в нужную группу или канал.
+2. Отправьте в этот чат любое сообщение.
+3. Запустите helper:
 
 ```bash
-/opt/call_brief_ai/instructions.json
+cd /opt/call_brief_ai/current
+set -a
+source /opt/call_brief_ai/shared/.env
+set +a
+/opt/call_brief_ai/current/.venv/bin/python get_telegram_chat_id.py
 ```
 
-### 5. Узнайте `TELEGRAM_CHAT_ID`
-
-Добавьте бота в нужную группу, отправьте туда любое сообщение и выполните:
+Если у бота ранее был webhook и `getUpdates` возвращает `409 Conflict`, используйте:
 
 ```bash
-source .venv/bin/activate
-python get_telegram_chat_id.py
+cd /opt/call_brief_ai/current
+set -a
+source /opt/call_brief_ai/shared/.env
+set +a
+TELEGRAM_DROP_WEBHOOK=1 /opt/call_brief_ai/current/.venv/bin/python get_telegram_chat_id.py
 ```
 
-Если у бота уже был webhook и `getUpdates` пустой:
+## Запуск вручную
 
 ```bash
-TELEGRAM_DROP_WEBHOOK=1 python get_telegram_chat_id.py
+cd /opt/call_brief_ai/current
+set -a
+source /opt/call_brief_ai/shared/.env
+set +a
+/opt/call_brief_ai/current/.venv/bin/python callbot_daemon.py
 ```
-
-### 6. Запуск
-
-```bash
-source .venv/bin/activate
-python callbot_daemon.py
-```
-
-## Как работает разбиение
-
-- Аудио сначала приводится к mono MP3.
-- Если нормализованный файл меньше или равен 4 МБ, он уходит в OpenAI как есть.
-- Если файл больше 4 МБ, сервис режет его на части через `ffmpeg`.
-- Каждая часть должна быть не больше `TARGET_PART_MAX_BYTES`.
-- Если часть все равно превышает лимит OpenAI, сервис завершает обработку ошибкой.
-
-## Что попадает в JSON
-
-Рядом с `call_001.mp3` создается `call_001.json`, где есть:
-
-- `source` - путь, размер, время модификации и метаданные из имени файла.
-- `transcription` - полный текст, диалог по спикерам, сегменты, длительность, usage и список частей.
-- `analysis` - результат шага анализа или причина пропуска.
-- `telegram` - информация об отправке в Telegram.
 
 ## Systemd
 
-Шаблон лежит в `callbot.service.example`.
+Для ручной установки можно использовать `callbot.service.example`.
 
-## Автодеплой
-
-Для автодеплоя на VPS при каждом push в git теперь добавлены:
-
-- `.github/workflows/deploy.yml`
-- `deploy/remote_deploy.sh`
-- `deploy/callbot.service`
-
-Полная пошаговая инструкция лежит в `DEPLOYMENT.md`.
-
-Обычный сценарий:
+Типовой запуск:
 
 ```bash
 sudo cp callbot.service.example /etc/systemd/system/callbot.service
 sudo systemctl daemon-reload
 sudo systemctl enable callbot.service
-sudo systemctl start callbot.service
-sudo systemctl status callbot.service
+sudo systemctl restart callbot.service
+sudo systemctl status callbot.service --no-pager
 ```
 
-## Замечания
+Живые логи:
 
-- Для FTP сервис сначала пробует `MLSD`, а если сервер его не поддерживает, переключается на `NLST`.
-- Для SFTP используется рекурсивный обход через `paramiko`.
-- При временном timeout подключения сервис повторит соединение и, если хранилище недоступно, просто пропустит текущий цикл сканирования.
-- Локальное состояние daemon хранится в `STATE_PATH` (по умолчанию `/opt/call_brief_ai/shared/state.json`).
-- Если на удаленном хранилище уже лежит одноименный `.json`, сервис считает запись обработанной и повторно ее не берет.
-- Поэтому удаление только `state.json` не запускает повторную обработку: для reprocess нужно удалить и запись из `state.json`, и одноименный `.json` рядом с аудио.
-- Все секреты храните только в `.env`.
+```bash
+sudo journalctl -u callbot.service -f
+```
+
+## Auto-deploy
+
+Проект уже настроен на deploy через GitHub Actions.
+
+Workflow:
+
+- собирает release archive
+- загружает его на VPS
+- раскладывает релиз в `/opt/call_brief_ai/releases/<commit_sha>`
+- обновляет symlink `/opt/call_brief_ai/current`
+- перезапускает `callbot.service`
+- оставляет только последние `RELEASES_TO_KEEP` релизов
+
+Подробный пошаговый гайд лежит в [DEPLOYMENT.md](DEPLOYMENT.md).

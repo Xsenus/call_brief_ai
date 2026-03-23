@@ -16,7 +16,7 @@ def make_config(**overrides):
         "ftp_encoding": "utf-8",
         "ftp_encoding_fallbacks": ["cp1251"],
         "ftp_remote_root": "/recordings",
-        "ftp_archive_dir": "/archive",
+        "ftp_archive_dir": "/recordings/archive",
         "ftp_delete_after_success": False,
         "ftp_move_to_archive_after_success": True,
         "ftp_use_tls": False,
@@ -49,7 +49,7 @@ def make_config(**overrides):
         "telegram_chat_id": "-1001",
         "telegram_message_thread_id": None,
         "telegram_proxy": "",
-        "poll_interval_sec": 300,
+        "poll_interval_sec": 60,
         "min_stable_polls": 2,
         "min_audio_bytes": 102400,
         "min_dialogue_words": 30,
@@ -316,6 +316,25 @@ class AnalysisDefaultsTests(unittest.TestCase):
     def test_defaults_reasoning_effort_for_gpt5_models(self):
         self.assertEqual(daemon.default_analysis_reasoning_effort("gpt-5-mini"), "low")
         self.assertEqual(daemon.default_analysis_reasoning_effort("gpt-4.1-mini"), "")
+
+
+class ConfigDefaultsTests(unittest.TestCase):
+    def test_from_env_defaults_poll_interval_and_archive_dir_from_remote_root(self):
+        env = {
+            "OPENAI_API_KEY": "sk-test",
+            "FTP_HOST": "example.com",
+            "FTP_USER": "user",
+            "FTP_PASSWORD": "pass",
+            "TELEGRAM_BOT_TOKEN": "123:test",
+            "TELEGRAM_CHAT_ID": "-1001",
+            "FTP_REMOTE_ROOT": "/recordings",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=True):
+            cfg = daemon.Config.from_env()
+
+        self.assertEqual(cfg.poll_interval_sec, 60)
+        self.assertEqual(cfg.ftp_archive_dir, "/recordings/archive")
 
 
 if __name__ == "__main__":
