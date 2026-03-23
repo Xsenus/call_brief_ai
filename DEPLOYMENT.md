@@ -490,6 +490,9 @@ Workflow сделает следующее:
 8. Обновит symlink `/opt/call_brief_ai/current`.
 9. Перезагрузит `systemd`.
 10. Перезапустит `callbot.service`.
+11. Оставит только последние `RELEASES_TO_KEEP` релизов в `/opt/call_brief_ai/releases` (по умолчанию `3`).
+
+По умолчанию workflow хранит 3 последних релиза. Если хотите другое число, измените `RELEASES_TO_KEEP` в `.github/workflows/deploy.yml`.
 
 ## 12. Как проверить сервис после деплоя
 
@@ -523,6 +526,11 @@ ls -lah /opt/call_brief_ai/current
 ls -lah /opt/call_brief_ai/releases
 ```
 
+Сколько релизов хранится:
+
+- По умолчанию: `3`
+- Настраивается переменной `RELEASES_TO_KEEP` в `.github/workflows/deploy.yml`
+
 Проверить `.env`:
 
 ```bash
@@ -539,6 +547,20 @@ git add .
 git commit -m "Describe changes"
 git push
 ```
+
+## 13.1 Где хранится состояние обработки
+
+Сервис хранит состояние в двух местах:
+
+- `/opt/call_brief_ai/shared/state.json` — локальная служебная память daemon.
+- `*.json` рядом с аудио на FTP/SFTP — результат расшифровки, анализа и отправки в Telegram.
+
+Важно: удаление только `/opt/call_brief_ai/shared/state.json` не запускает повторную обработку, если рядом с аудио уже лежит одноименный `*.json`.
+
+Чтобы заново обработать конкретный звонок, нужно удалить оба следа:
+
+1. запись о файле из `/opt/call_brief_ai/shared/state.json`
+2. одноименный `*.json` рядом с исходным `*.mp3` на FTP/SFTP
 
 Больше ничего руками на VPS делать не нужно, если:
 

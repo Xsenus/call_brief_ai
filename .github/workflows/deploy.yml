@@ -15,6 +15,7 @@ env:
   APP_NAME: call_brief_ai
   APP_BASE_DIR: /opt/call_brief_ai
   SERVICE_NAME: callbot.service
+  RELEASES_TO_KEEP: 3
 
 jobs:
   deploy:
@@ -85,4 +86,5 @@ jobs:
             APP_NAME='${APP_NAME}' \
             APP_BASE_DIR='${APP_BASE_DIR}' \
             SERVICE_NAME='${SERVICE_NAME}' \
+            RELEASES_TO_KEEP='${RELEASES_TO_KEEP}' \
             bash /tmp/remote_deploy.sh /tmp/release.tar.gz '${GITHUB_SHA}' /tmp/callbot.service"

@@ -12,6 +12,7 @@ APP_USER="${APP_USER:-callbot}"
 APP_GROUP="${APP_GROUP:-$APP_USER}"
 APP_BASE_DIR="${APP_BASE_DIR:-/opt/${APP_NAME}}"
 SERVICE_NAME="${SERVICE_NAME:-callbot.service}"
+RELEASES_TO_KEEP="${RELEASES_TO_KEEP:-3}"
 RELEASES_DIR="${APP_BASE_DIR}/releases"
 SHARED_DIR="${APP_BASE_DIR}/shared"
 CURRENT_LINK="${APP_BASE_DIR}/current"
@@ -29,6 +30,11 @@ fi
 
 if [[ ! -f "${SERVICE_SOURCE}" ]]; then
   echo "Service file not found: ${SERVICE_SOURCE}" >&2
+  exit 1
+fi
+
+if [[ ! "${RELEASES_TO_KEEP}" =~ ^[0-9]+$ ]] || [[ "${RELEASES_TO_KEEP}" -lt 1 ]]; then
+  echo "RELEASES_TO_KEEP must be a positive integer, got: ${RELEASES_TO_KEEP}" >&2
   exit 1
 fi
 
@@ -73,11 +79,12 @@ systemctl restart "${SERVICE_NAME}"
 
 find "${RELEASES_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
   | sort -nr \
-  | awk 'NR > 5 {print $2}' \
+  | awk -v keep="${RELEASES_TO_KEEP}" 'NR > keep {print $2}' \
   | xargs -r rm -rf
 
 rm -f "${RELEASE_ARCHIVE}" "${SERVICE_SOURCE}" /tmp/remote_deploy.sh
 
 echo "Deployment finished."
 echo "Current release: ${RELEASE_DIR}"
+echo "Releases retained: ${RELEASES_TO_KEEP}"
 systemctl --no-pager --full status "${SERVICE_NAME}" || true
