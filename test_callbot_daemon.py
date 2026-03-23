@@ -443,5 +443,54 @@ class ScanCycleTests(unittest.TestCase):
             mocked_process.assert_not_called()
 
 
+class TranscriptionRequestTests(unittest.TestCase):
+    def test_transcribe_part_uses_requests_endpoint_with_proxy(self):
+        cfg = make_config(openai_proxy="http://proxy.example:8888")
+        clients = daemon.OpenAIClients(
+            primary=mock.Mock(),
+            direct_fallback=None,
+            proxy_enabled=True,
+            proxy_failure_cooldown_sec=60,
+        )
+        response = mock.Mock()
+        response.json.return_value = {
+            "text": "test",
+            "segments": [],
+            "duration": 1.0,
+            "usage": {},
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = Path(temp_dir) / "sample.mp3"
+            audio_path.write_bytes(b"fake-audio")
+
+            with (
+                mock.patch(
+                    "callbot_daemon.run_openai_request",
+                    side_effect=lambda openai_clients, operation, cfg_arg, fn: fn(
+                        openai_clients.primary
+                    ),
+                ),
+                mock.patch(
+                    "callbot_daemon.requests.post",
+                    return_value=response,
+                ) as mocked_post,
+            ):
+                result = daemon.transcribe_part(clients, audio_path, cfg)
+
+        self.assertEqual(result["full_text"], "test")
+        self.assertEqual(
+            mocked_post.call_args.args[0],
+            "https://api.openai.com/v1/audio/transcriptions",
+        )
+        self.assertEqual(
+            mocked_post.call_args.kwargs["proxies"],
+            {
+                "http": "http://proxy.example:8888",
+                "https": "http://proxy.example:8888",
+            },
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

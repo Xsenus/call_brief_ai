@@ -171,6 +171,12 @@ def build_requests_proxies(proxy_url: str) -> Optional[Dict[str, str]]:
     }
 
 
+def build_openai_api_url(cfg: "Config", path: str) -> str:
+    base_url = (cfg.openai_base_url or "https://api.openai.com/v1").strip().rstrip("/")
+    suffix = path if path.startswith("/") else f"/{path}"
+    return f"{base_url}{suffix}"
+
+
 def iter_exception_chain(exc: BaseException):
     current: Optional[BaseException] = exc
     seen = set()
@@ -214,6 +220,81 @@ def describe_processing_error(
     }
     exception_chain = list(iter_exception_chain(exc))
     if not isinstance(exc, APIStatusError):
+        if any(isinstance(item, requests.exceptions.ProxyError) for item in exception_chain):
+            details["provider"] = "openai"
+            details["code"] = "proxy_error"
+            details["type"] = "connection_error"
+            details["hint"] = build_openai_connectivity_hint(openai_proxy)
+            if details["message"] == exc.__class__.__name__:
+                details["message"] = "OpenAI proxy rejected or could not tunnel the request"
+            return details
+        if any(
+            isinstance(item, requests.exceptions.ConnectTimeout)
+            for item in exception_chain
+        ):
+            details["provider"] = "openai"
+            details["code"] = "connect_timeout"
+            details["type"] = "timeout"
+            details["hint"] = build_openai_connectivity_hint(openai_proxy)
+            details["message"] = (
+                "Timed out while connecting to the OpenAI route"
+                if openai_proxy
+                else "Timed out while connecting to OpenAI"
+            )
+            return details
+        if any(
+            isinstance(item, (requests.exceptions.ReadTimeout, requests.exceptions.Timeout))
+            for item in exception_chain
+        ):
+            details["provider"] = "openai"
+            details["code"] = "timeout"
+            details["type"] = "timeout"
+            details["hint"] = build_openai_connectivity_hint(openai_proxy)
+            return details
+        if any(
+            isinstance(item, requests.exceptions.ConnectionError)
+            for item in exception_chain
+        ):
+            details["provider"] = "openai"
+            details["code"] = "connection_error"
+            details["type"] = "connection_error"
+            details["hint"] = build_openai_connectivity_hint(openai_proxy)
+            return details
+        http_error = next(
+            (
+                item
+                for item in exception_chain
+                if isinstance(item, requests.exceptions.HTTPError)
+            ),
+            None,
+        )
+        if http_error is not None:
+            details["provider"] = "openai"
+            response = getattr(http_error, "response", None)
+            if response is not None:
+                details["status_code"] = response.status_code
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = None
+                if isinstance(payload, dict):
+                    error_payload = payload.get("error")
+                    if isinstance(error_payload, dict):
+                        provider_message = error_payload.get("message")
+                        if provider_message:
+                            details["message"] = str(provider_message).strip()
+                        code = error_payload.get("code")
+                        if code:
+                            details["code"] = str(code).strip() or None
+                        error_type = error_payload.get("type")
+                        if error_type:
+                            details["type"] = str(error_type).strip() or None
+                if details["message"] == exc.__class__.__name__:
+                    details["message"] = (
+                        response.text.strip()
+                        or f"OpenAI request failed with HTTP {response.status_code}"
+                    )
+            return details
         if any(isinstance(item, httpx.ProxyError) for item in exception_chain):
             details["provider"] = "openai"
             details["code"] = "proxy_error"
@@ -617,10 +698,10 @@ def is_retryable_openai_error(
 ) -> bool:
     if details.get("provider") != "openai" or not details.get("retryable", True):
         return False
+    status_code = details.get("status_code")
+    if isinstance(status_code, int):
+        return status_code in {408, 409, 429} or status_code >= 500
     if isinstance(exc, APIStatusError):
-        status_code = details.get("status_code")
-        if isinstance(status_code, int):
-            return status_code in {408, 409, 429} or status_code >= 500
         return False
     return details.get("code") in {
         "proxy_error",
@@ -1658,23 +1739,40 @@ def build_error_document(
 
 
 def transcribe_part(client: OpenAIClients, audio_path: Path, cfg: Config) -> Dict[str, Any]:
-    with audio_path.open("rb") as audio_file:
-        def create_transcription(openai_client: OpenAI):
-            audio_file.seek(0)
-            return openai_client.audio.transcriptions.create(
-                file=audio_file,
-                model=cfg.transcribe_model,
-                language=cfg.transcribe_language,
-                response_format="diarized_json",
-                chunking_strategy=cfg.transcribe_chunking_strategy,
+    def create_transcription_via_requests(openai_client: OpenAI) -> Dict[str, Any]:
+        proxy_url = ""
+        if not (client.direct_fallback is not None and openai_client is client.direct_fallback):
+            proxy_url = cfg.openai_proxy
+        with audio_path.open("rb") as audio_file:
+            response = requests.post(
+                build_openai_api_url(cfg, "/audio/transcriptions"),
+                headers={
+                    "Authorization": f"Bearer {cfg.openai_api_key}",
+                },
+                data={
+                    "model": cfg.transcribe_model,
+                    "language": cfg.transcribe_language,
+                    "response_format": "diarized_json",
+                    "chunking_strategy": cfg.transcribe_chunking_strategy,
+                },
+                files={
+                    "file": (audio_path.name, audio_file, "audio/mpeg"),
+                },
+                timeout=(
+                    cfg.openai_connect_timeout_sec,
+                    cfg.openai_timeout_sec,
+                ),
+                proxies=build_requests_proxies(proxy_url),
             )
+            response.raise_for_status()
+            return response.json()
 
-        transcription = run_openai_request(
-            client,
-            f"transcription for {audio_path.name}",
-            cfg,
-            create_transcription,
-        )
+    transcription = run_openai_request(
+        client,
+        f"transcription for {audio_path.name}",
+        cfg,
+        create_transcription_via_requests,
+    )
 
     data = response_to_dict(transcription)
     segments = data.get("segments") or []
