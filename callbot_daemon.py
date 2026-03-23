@@ -140,6 +140,26 @@ def replace_ext(remote_path: str, new_ext: str) -> str:
     return f"{base}{new_ext}"
 
 
+def remote_path_is_within(path: str, directory: str) -> bool:
+    normalized_path = normalize_remote_path(path)
+    normalized_directory = normalize_remote_path(directory)
+    if normalized_directory == "/":
+        return normalized_path == "/"
+    return normalized_path == normalized_directory or normalized_path.startswith(
+        normalized_directory.rstrip("/") + "/"
+    )
+
+
+def should_skip_remote_scan_path(cfg: "Config", remote_path: str) -> bool:
+    if not cfg.ftp_move_to_archive_after_success:
+        return False
+    archive_dir = normalize_remote_path(cfg.ftp_archive_dir)
+    remote_root = normalize_remote_path(cfg.ftp_remote_root)
+    if archive_dir == remote_root:
+        return False
+    return remote_path_is_within(remote_path, archive_dir)
+
+
 def parse_ftp_modify(raw: Optional[str]) -> Optional[datetime]:
     if not raw:
         return None
@@ -1141,6 +1161,8 @@ def sftp_walk(cfg: Config, root: str) -> List[Dict[str, Any]]:
             if name in (".", ".."):
                 continue
             full_path = join_remote_path(path, name)
+            if should_skip_remote_scan_path(cfg, full_path):
+                continue
             modify = None
             if getattr(entry, "st_mtime", None):
                 modify = datetime.fromtimestamp(
@@ -1264,7 +1286,7 @@ def safe_ftp_modify(ftp, remote_path: str) -> Optional[str]:
     return None
 
 
-def ftp_walk_mlsd(ftp, root: str) -> List[Dict[str, Any]]:
+def ftp_walk_mlsd(ftp, root: str, cfg: Config) -> List[Dict[str, Any]]:
     result: List[Dict[str, Any]] = []
 
     def walk(path: str) -> None:
@@ -1279,6 +1301,8 @@ def ftp_walk_mlsd(ftp, root: str) -> List[Dict[str, Any]]:
             if name in (".", ".."):
                 continue
             full_path = join_remote_path(path, name)
+            if should_skip_remote_scan_path(cfg, full_path):
+                continue
             item_type = facts.get("type")
             if item_type == "dir":
                 walk(full_path)
@@ -1298,7 +1322,7 @@ def ftp_walk_mlsd(ftp, root: str) -> List[Dict[str, Any]]:
     return result
 
 
-def ftp_walk_nlst(ftp, root: str) -> List[Dict[str, Any]]:
+def ftp_walk_nlst(ftp, root: str, cfg: Config) -> List[Dict[str, Any]]:
     result: List[Dict[str, Any]] = []
     visited_dirs = set()
 
@@ -1334,6 +1358,8 @@ def ftp_walk_nlst(ftp, root: str) -> List[Dict[str, Any]]:
                 if raw_entry.startswith("/")
                 else join_remote_path(normalized_path, name)
             )
+            if should_skip_remote_scan_path(cfg, full_path):
+                continue
             if is_remote_dir(ftp, full_path):
                 walk(full_path)
                 continue
@@ -1350,16 +1376,16 @@ def ftp_walk_nlst(ftp, root: str) -> List[Dict[str, Any]]:
     return result
 
 
-def ftp_walk(ftp, root: str) -> List[Dict[str, Any]]:
+def ftp_walk(ftp, root: str, cfg: Config) -> List[Dict[str, Any]]:
     try:
-        return ftp_walk_mlsd(ftp, root)
+        return ftp_walk_mlsd(ftp, root, cfg)
     except all_errors as exc:
         if not is_mlsd_unsupported(exc):
             raise
         logging.warning(
             "FTP server does not support MLSD, falling back to NLST scan: %s", exc
         )
-        return ftp_walk_nlst(ftp, root)
+        return ftp_walk_nlst(ftp, root, cfg)
 
 
 def iter_ftp_encodings(cfg: Config) -> List[str]:
@@ -1385,7 +1411,7 @@ def remote_walk(cfg: Config) -> List[Dict[str, Any]]:
     for encoding in iter_ftp_encodings(cfg):
         try:
             with closing(ftp_connect(cfg, encoding=encoding)) as ftp:
-                files = ftp_walk(ftp, cfg.ftp_remote_root)
+                files = ftp_walk(ftp, cfg.ftp_remote_root, cfg)
             if encoding.lower() != cfg.ftp_encoding.lower():
                 logging.warning(
                     "FTP listing is not valid %s; switched runtime encoding to %s. "

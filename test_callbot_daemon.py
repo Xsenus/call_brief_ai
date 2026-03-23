@@ -402,6 +402,44 @@ class ConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(cfg.ftp_archive_dir, "/recordings/archive")
 
 
+class RemoteScanExclusionTests(unittest.TestCase):
+    def test_skips_archive_directory_when_archive_is_enabled(self):
+        cfg = make_config(
+            ftp_remote_root="/recordings",
+            ftp_archive_dir="/recordings/archive",
+            ftp_move_to_archive_after_success=True,
+        )
+
+        self.assertTrue(
+            daemon.should_skip_remote_scan_path(
+                cfg, "/recordings/archive/call.mp3"
+            )
+        )
+        self.assertTrue(
+            daemon.should_skip_remote_scan_path(
+                cfg, "/recordings/archive/nested/call.mp3"
+            )
+        )
+        self.assertFalse(
+            daemon.should_skip_remote_scan_path(
+                cfg, "/recordings/call.mp3"
+            )
+        )
+
+    def test_does_not_skip_all_files_if_archive_equals_root(self):
+        cfg = make_config(
+            ftp_remote_root="/recordings",
+            ftp_archive_dir="/recordings",
+            ftp_move_to_archive_after_success=True,
+        )
+
+        self.assertFalse(
+            daemon.should_skip_remote_scan_path(
+                cfg, "/recordings/call.mp3"
+            )
+        )
+
+
 class ScanCycleTests(unittest.TestCase):
     def test_scan_cycle_skips_route_probe_when_no_files_need_processing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
