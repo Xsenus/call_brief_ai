@@ -402,5 +402,46 @@ class ConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(cfg.ftp_archive_dir, "/recordings/archive")
 
 
+class ScanCycleTests(unittest.TestCase):
+    def test_scan_cycle_skips_route_probe_when_no_files_need_processing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cfg = make_config(
+                openai_proxy="http://proxy.example:8888",
+                state_path=Path(temp_dir) / "state.json",
+                work_root=Path(temp_dir),
+            )
+            state = {
+                "files": {
+                    "/recordings/call.mp3": {
+                        "stage": "done",
+                        "processed_sig": "123456:20260323070000",
+                    }
+                }
+            }
+            clients = daemon.OpenAIClients(
+                primary=mock.Mock(),
+                direct_fallback=None,
+                proxy_enabled=True,
+                proxy_failure_cooldown_sec=60,
+            )
+            remote_file = {
+                "path": "/recordings/call.mp3",
+                "name": "call.mp3",
+                "size": 123456,
+                "modify": "20260323070000",
+            }
+
+            with (
+                mock.patch("callbot_daemon.load_instruction_text", return_value="Instruction"),
+                mock.patch("callbot_daemon.remote_walk", return_value=[remote_file]),
+                mock.patch("callbot_daemon.verify_openai_route_before_processing") as mocked_probe,
+                mock.patch("callbot_daemon.process_remote_audio") as mocked_process,
+            ):
+                daemon.scan_cycle(cfg, clients, state)
+
+            mocked_probe.assert_not_called()
+            mocked_process.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

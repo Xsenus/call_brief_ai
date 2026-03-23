@@ -2434,6 +2434,7 @@ def should_process_file(
         entry["ftp_modify_iso"] = modify_dt.isoformat()
 
     if entry.get("stage") == "done" and entry.get("processed_sig") == current_sig:
+        entry["skip_reason"] = entry.get("skip_reason") or "already processed"
         return False
 
     if stable_polls < cfg.min_stable_polls:
@@ -2502,7 +2503,22 @@ def scan_cycle(cfg: Config, client: OpenAIClients, state: Dict[str, Any]) -> Non
     audio_files.sort(key=lambda item: item["path"])
 
     logging.info("Cycle started. Found %s audio file(s).", len(audio_files))
-    if audio_files and not verify_openai_route_before_processing(cfg, client):
+    processable_files = [
+        remote_file
+        for remote_file in audio_files
+        if should_process_file(remote_file, remote_files_by_path, state, cfg)
+    ]
+    save_state(cfg.state_path, state)
+
+    if not processable_files:
+        logging.info("Cycle finished. No audio files required processing.")
+        return
+
+    logging.info(
+        "Queued %s audio file(s) for processing this cycle.",
+        len(processable_files),
+    )
+    if not verify_openai_route_before_processing(cfg, client):
         logging.warning(
             "Skipping cycle before FTP downloads because the OpenAI route is unavailable."
         )
@@ -2516,7 +2532,7 @@ def scan_cycle(cfg: Config, client: OpenAIClients, state: Dict[str, Any]) -> Non
             openai_proxy_route_cooldown_remaining_sec(client),
         )
         return
-    for remote_file in audio_files:
+    for remote_file in processable_files:
         if (
             openai_proxy_route_is_in_cooldown(client)
             and client.direct_fallback is None
@@ -2526,9 +2542,8 @@ def scan_cycle(cfg: Config, client: OpenAIClients, state: Dict[str, Any]) -> Non
                 openai_proxy_route_cooldown_remaining_sec(client),
             )
             break
-        if should_process_file(remote_file, remote_files_by_path, state, cfg):
-            save_state(cfg.state_path, state)
-            process_remote_audio(cfg, client, instruction_text, state, remote_file)
+        save_state(cfg.state_path, state)
+        process_remote_audio(cfg, client, instruction_text, state, remote_file)
 
     save_state(cfg.state_path, state)
     logging.info("Cycle finished.")
