@@ -177,6 +177,16 @@ def build_openai_api_url(cfg: "Config", path: str) -> str:
     return f"{base_url}{suffix}"
 
 
+def resolve_openai_proxy_url(
+    openai_clients: "OpenAIClients",
+    openai_client: OpenAI,
+    cfg: "Config",
+) -> str:
+    if openai_clients.direct_fallback is not None and openai_client is openai_clients.direct_fallback:
+        return ""
+    return cfg.openai_proxy
+
+
 def iter_exception_chain(exc: BaseException):
     current: Optional[BaseException] = exc
     seen = set()
@@ -845,9 +855,19 @@ def verify_openai_route_before_processing(
             openai_clients,
             "route probe",
             cfg,
-            lambda openai_client: openai_client.with_options(
-                timeout=build_openai_route_probe_timeout(cfg)
-            ).models.list(),
+            lambda openai_client: requests.get(
+                build_openai_api_url(cfg, "/models"),
+                headers={
+                    "Authorization": f"Bearer {cfg.openai_api_key}",
+                },
+                timeout=(
+                    cfg.openai_route_probe_connect_timeout_sec,
+                    cfg.openai_route_probe_timeout_sec,
+                ),
+                proxies=build_requests_proxies(
+                    resolve_openai_proxy_url(openai_clients, openai_client, cfg)
+                ),
+            ).raise_for_status(),
         )
         return True
     except Exception as exc:
@@ -1740,9 +1760,7 @@ def build_error_document(
 
 def transcribe_part(client: OpenAIClients, audio_path: Path, cfg: Config) -> Dict[str, Any]:
     def create_transcription_via_requests(openai_client: OpenAI) -> Dict[str, Any]:
-        proxy_url = ""
-        if not (client.direct_fallback is not None and openai_client is client.direct_fallback):
-            proxy_url = cfg.openai_proxy
+        proxy_url = resolve_openai_proxy_url(client, openai_client, cfg)
         with audio_path.open("rb") as audio_file:
             response = requests.post(
                 build_openai_api_url(cfg, "/audio/transcriptions"),
@@ -2122,11 +2140,31 @@ def analyze_transcript(
     cfg: Config,
 ) -> str:
     request = build_analysis_request(instruction_text, transcript_doc, cfg)
+
+    def create_analysis_response(openai_client: OpenAI, request_payload: Dict[str, Any]) -> Dict[str, Any]:
+        response = requests.post(
+            build_openai_api_url(cfg, "/responses"),
+            headers={
+                "Authorization": f"Bearer {cfg.openai_api_key}",
+                "Content-Type": "application/json",
+            },
+            json=request_payload,
+            timeout=(
+                cfg.openai_connect_timeout_sec,
+                cfg.openai_timeout_sec,
+            ),
+            proxies=build_requests_proxies(
+                resolve_openai_proxy_url(client, openai_client, cfg)
+            ),
+        )
+        response.raise_for_status()
+        return response.json()
+
     response = run_openai_request(
         client,
         "analysis request",
         cfg,
-        lambda openai_client: openai_client.responses.create(**request),
+        lambda openai_client: create_analysis_response(openai_client, request),
     )
     response_info = inspect_response_output(response)
     if response_info["text"]:
@@ -2156,7 +2194,7 @@ def analyze_transcript(
             client,
             "analysis retry",
             cfg,
-            lambda openai_client: openai_client.responses.create(**retry_request),
+            lambda openai_client: create_analysis_response(openai_client, retry_request),
         )
         response_info = inspect_response_output(response)
         if response_info["text"]:

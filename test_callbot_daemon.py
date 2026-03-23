@@ -491,6 +491,61 @@ class TranscriptionRequestTests(unittest.TestCase):
             },
         )
 
+    def test_analyze_transcript_uses_requests_responses_endpoint_with_proxy(self):
+        cfg = make_config(openai_proxy="http://proxy.example:8888")
+        clients = daemon.OpenAIClients(
+            primary=mock.Mock(),
+            direct_fallback=None,
+            proxy_enabled=True,
+            proxy_failure_cooldown_sec=60,
+        )
+        response = mock.Mock()
+        response.json.return_value = {
+            "id": "resp_123",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "status": "completed",
+                    "content": [
+                        {"type": "output_text", "text": "Готово"},
+                    ],
+                }
+            ],
+        }
+
+        with (
+            mock.patch(
+                "callbot_daemon.run_openai_request",
+                side_effect=lambda openai_clients, operation, cfg_arg, fn: fn(
+                    openai_clients.primary
+                ),
+            ),
+            mock.patch(
+                "callbot_daemon.requests.post",
+                return_value=response,
+            ) as mocked_post,
+        ):
+            result = daemon.analyze_transcript(
+                clients,
+                "Сделай сводку",
+                {"transcription": {"dialogue_text": "Тест"}},
+                cfg,
+            )
+
+        self.assertEqual(result, "Готово")
+        self.assertEqual(
+            mocked_post.call_args.args[0],
+            "https://api.openai.com/v1/responses",
+        )
+        self.assertEqual(
+            mocked_post.call_args.kwargs["proxies"],
+            {
+                "http": "http://proxy.example:8888",
+                "https": "http://proxy.example:8888",
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
