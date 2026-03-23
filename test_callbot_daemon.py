@@ -317,6 +317,269 @@ class TelegramTests(unittest.TestCase):
             self.assertEqual(saved_doc["stage"], "done")
 
 
+class FilenameMetadataTests(unittest.TestCase):
+    def test_parse_filename_metadata_supports_phone_manager_pattern(self):
+        data = daemon.parse_filename_metadata(
+            "2024-11-02__16-56-29__79621625788__Manager_Name_677.mp3"
+        )
+
+        self.assertEqual(data["file_date"], "2024-11-02")
+        self.assertEqual(data["file_time"], "16-56-29")
+        self.assertEqual(data["file_phone"], "79621625788")
+        self.assertEqual(data["manager_name"], "Manager Name")
+        self.assertEqual(data["call_suffix"], "677")
+        self.assertIsNone(data["counterparty_name"])
+
+    def test_parse_filename_metadata_supports_manager_phone_pattern(self):
+        data = daemon.parse_filename_metadata(
+            "2024-11-06__07-41-19__Manager_Name__73472681128_672.mp3"
+        )
+
+        self.assertEqual(data["manager_name"], "Manager Name")
+        self.assertEqual(data["file_phone"], "73472681128")
+        self.assertEqual(data["call_suffix"], "672")
+        self.assertIsNone(data["counterparty_name"])
+
+    def test_parse_filename_metadata_supports_counterparty_pattern(self):
+        data = daemon.parse_filename_metadata(
+            "2025-03-21__12-07-27__Manager_Name__Counterparty_User_384.mp3"
+        )
+
+        self.assertEqual(data["manager_name"], "Manager Name")
+        self.assertEqual(data["counterparty_name"], "Counterparty User")
+        self.assertEqual(data["call_suffix"], "384")
+        self.assertIsNone(data["file_phone"])
+
+
+class ExistingRemoteJsonDecisionTests(unittest.TestCase):
+    def test_should_process_file_skips_when_remote_json_is_completed(self):
+        cfg = make_config(min_stable_polls=1)
+        state = {"files": {}}
+        remote_file = {
+            "path": "/recordings/call.mp3",
+            "name": "call.mp3",
+            "size": 123456,
+            "modify": "20260323070000",
+        }
+        remote_json_meta = {
+            "path": "/recordings/call.json",
+            "name": "call.json",
+            "size": 100,
+            "modify": "20260323070001",
+        }
+        saved_doc = {
+            "stage": "done",
+            "status": "ok",
+            "source": {"ftp_path_audio": "/recordings/call.mp3"},
+        }
+
+        with mock.patch("callbot_daemon.remote_load_json", return_value=saved_doc):
+            result = daemon.should_process_file(
+                remote_file,
+                {
+                    remote_file["path"]: remote_file,
+                    remote_json_meta["path"]: remote_json_meta,
+                },
+                state,
+                cfg,
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(state["files"]["/recordings/call.mp3"]["stage"], "done")
+        self.assertEqual(
+            state["files"]["/recordings/call.mp3"]["skip_reason"],
+            "remote json already completed",
+        )
+
+    def test_should_process_file_retries_when_remote_json_is_error(self):
+        cfg = make_config(min_stable_polls=1)
+        state = {"files": {}}
+        remote_file = {
+            "path": "/recordings/call.mp3",
+            "name": "call.mp3",
+            "size": 123456,
+            "modify": "20260323070000",
+        }
+        remote_json_meta = {
+            "path": "/recordings/call.json",
+            "name": "call.json",
+            "size": 100,
+            "modify": "20260323070001",
+        }
+        saved_doc = {
+            "stage": "error",
+            "status": "error",
+            "source": {"ftp_path_audio": "/recordings/call.mp3"},
+        }
+
+        with mock.patch("callbot_daemon.remote_load_json", return_value=saved_doc):
+            result = daemon.should_process_file(
+                remote_file,
+                {
+                    remote_file["path"]: remote_file,
+                    remote_json_meta["path"]: remote_json_meta,
+                },
+                state,
+                cfg,
+            )
+
+        self.assertTrue(result)
+        self.assertNotEqual(
+            state["files"]["/recordings/call.mp3"].get("stage"),
+            "done",
+        )
+
+
+class ResumeProcessingTests(unittest.TestCase):
+    def test_process_remote_audio_reuses_saved_transcription_for_analysis(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cfg = make_config(
+                state_path=Path(temp_dir) / "state.json",
+                work_root=Path(temp_dir),
+                min_dialogue_words=1,
+            )
+            state = {"files": {}}
+            remote_file = {
+                "path": "/recordings/call.mp3",
+                "name": "call.mp3",
+                "size": 123456,
+                "modify": "20260323070000",
+            }
+            saved_doc = {
+                "generated_at": "2026-03-23T00:00:00+00:00",
+                "stage": "error",
+                "status": "error",
+                "source": {"ftp_path_audio": "/recordings/call.mp3"},
+                "transcription": {
+                    "dialogue_text": "Person 1: test",
+                    "full_text": "test",
+                    "word_count": 1,
+                    "duration_min_total": 1.0,
+                    "parts_planned": 1,
+                    "parts_completed": 1,
+                    "parts_failed": 0,
+                    "parts": [{"status": "ok"}],
+                },
+            }
+
+            with (
+                mock.patch("callbot_daemon.remote_load_json", return_value=saved_doc),
+                mock.patch(
+                    "callbot_daemon.analyze_transcript",
+                    return_value="Ready message",
+                ) as mocked_analyze,
+                mock.patch(
+                    "callbot_daemon.send_telegram_message",
+                    return_value=[{"result": {"message_id": 7}}],
+                ),
+                mock.patch("callbot_daemon.remote_upload_json") as mocked_upload,
+                mock.patch("callbot_daemon.remote_archive_or_delete") as mocked_archive,
+                mock.patch("callbot_daemon.remote_download_file") as mocked_download,
+                mock.patch("callbot_daemon.prepare_audio_parts") as mocked_prepare,
+                mock.patch("callbot_daemon.transcribe_part") as mocked_transcribe,
+            ):
+                daemon.process_remote_audio(
+                    cfg=cfg,
+                    client=mock.Mock(),
+                    instruction_text="Instruction",
+                    state=state,
+                    remote_file=remote_file,
+                )
+
+            mocked_download.assert_not_called()
+            mocked_prepare.assert_not_called()
+            mocked_transcribe.assert_not_called()
+            mocked_analyze.assert_called_once()
+            mocked_archive.assert_called_once_with(cfg, "/recordings/call.mp3")
+            self.assertGreaterEqual(mocked_upload.call_count, 2)
+            self.assertEqual(saved_doc["stage"], "done")
+            self.assertEqual(saved_doc["status"], "ok")
+
+
+class TranscriptDocumentTests(unittest.TestCase):
+    def test_build_transcript_document_aggregates_usage_and_part_metadata(self):
+        cfg = make_config()
+        remote_file = {
+            "path": "/recordings/2024-11-06__07-41-19__Manager_Name__73472681128_672.mp3",
+            "name": "2024-11-06__07-41-19__Manager_Name__73472681128_672.mp3",
+            "size": 123456,
+            "modify": "20260323070000",
+        }
+        part_results = [
+            {
+                "part_index": 1,
+                "parts_total": 2,
+                "part_name": "part_001.mp3",
+                "size_bytes": 111,
+                "duration_sec": 10.0,
+                "start_offset_sec": 0.0,
+                "status": "ok",
+                "error": None,
+                "api_sent_at_utc": "2026-03-23T00:00:00+00:00",
+                "api_finished_at_utc": "2026-03-23T00:00:01+00:00",
+                "api_elapsed_sec": 1.2,
+                "full_text": "Hello",
+                "dialogue_text": "Person 1: Hello",
+                "segments": [{"speaker": "A", "text": "Hello", "start": 0.0, "end": 1.0}],
+                "usage": {
+                    "type": "tokens",
+                    "input_token_details": {"audio_tokens": 100, "text_tokens": 5},
+                    "output_tokens": 10,
+                },
+            },
+            {
+                "part_index": 2,
+                "parts_total": 2,
+                "part_name": "part_002.mp3",
+                "size_bytes": 222,
+                "duration_sec": 12.0,
+                "start_offset_sec": 10.0,
+                "status": "ok",
+                "error": None,
+                "api_sent_at_utc": "2026-03-23T00:00:02+00:00",
+                "api_finished_at_utc": "2026-03-23T00:00:03+00:00",
+                "api_elapsed_sec": 1.5,
+                "full_text": "World",
+                "dialogue_text": "Person 2: World",
+                "segments": [{"speaker": "B", "text": "World", "start": 0.5, "end": 2.0}],
+                "usage": {
+                    "type": "tokens",
+                    "input_token_details": {"audio_tokens": 200, "text_tokens": 7},
+                    "output_tokens": 20,
+                },
+            },
+        ]
+
+        doc = daemon.build_transcript_document(
+            remote_file,
+            part_results,
+            cfg,
+            planned_parts_count=2,
+            split_applied=True,
+        )
+
+        self.assertEqual(doc["status"], "transcribed")
+        self.assertTrue(doc["transcription"]["split_applied"])
+        self.assertEqual(doc["transcription"]["parts_planned"], 2)
+        self.assertEqual(doc["transcription"]["parts_completed"], 2)
+        self.assertEqual(doc["transcription"]["parts_failed"], 0)
+        self.assertEqual(doc["transcription"]["api_elapsed_sec_total"], 2.7)
+        self.assertEqual(doc["transcription"]["usage"]["type"], "tokens")
+        self.assertEqual(
+            doc["transcription"]["usage"]["input_token_details"]["audio_tokens"],
+            300,
+        )
+        self.assertEqual(
+            doc["transcription"]["usage"]["input_token_details"]["text_tokens"],
+            12,
+        )
+        self.assertEqual(doc["transcription"]["usage"]["output_tokens"], 30)
+        self.assertEqual(doc["source"]["file_metadata"]["manager_name"], "Manager Name")
+        self.assertEqual(doc["source"]["file_metadata"]["file_phone"], "73472681128")
+        self.assertEqual(doc["source"]["file_metadata"]["call_suffix"], "672")
+        self.assertEqual(doc["transcription"]["segments"][1]["start"], 10.5)
+
+
 class AnalysisDefaultsTests(unittest.TestCase):
     def test_defaults_reasoning_effort_for_gpt5_models(self):
         self.assertEqual(daemon.default_analysis_reasoning_effort("gpt-5-mini"), "low")
