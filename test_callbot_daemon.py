@@ -9,6 +9,7 @@ import callbot_daemon as daemon
 
 def make_config(**overrides):
     data = {
+        "ftp_enabled": True,
         "ftp_protocol": "sftp",
         "ftp_host": "example.com",
         "ftp_port": 22,
@@ -26,6 +27,15 @@ def make_config(**overrides):
         "ftp_timeout_sec": 60,
         "ftp_connect_attempts": 2,
         "ftp_retry_delay_sec": 5.0,
+        "yandex_disk_enabled": False,
+        "yandex_disk_oauth_token": "",
+        "yandex_disk_timeout_sec": 120,
+        "yandex_disk_remote_root": "disk:/recordings",
+        "yandex_disk_remote_roots": [],
+        "yandex_disk_archive_dir": "disk:/recordings/archive",
+        "yandex_disk_archive_dir_explicit": True,
+        "yandex_disk_delete_after_success": False,
+        "yandex_disk_move_to_archive_after_success": False,
         "openai_api_key": "sk-test",
         "openai_base_url": "",
         "openai_proxy": "",
@@ -304,7 +314,11 @@ class TelegramTests(unittest.TestCase):
 
             mocked_send.assert_called_once_with(cfg, "Готовое сообщение")
             mocked_upload.assert_called_once()
-            mocked_archive.assert_called_once_with(cfg, "/recordings/call.mp3")
+            mocked_archive.assert_called_once_with(
+                cfg,
+                "/recordings/call.mp3",
+                backend=daemon.REMOTE_BACKEND_FTP,
+            )
             mocked_download.assert_not_called()
             mocked_prepare.assert_not_called()
             mocked_transcribe.assert_not_called()
@@ -490,7 +504,11 @@ class ResumeProcessingTests(unittest.TestCase):
             mocked_prepare.assert_not_called()
             mocked_transcribe.assert_not_called()
             mocked_analyze.assert_called_once()
-            mocked_archive.assert_called_once_with(cfg, "/recordings/call.mp3")
+            mocked_archive.assert_called_once_with(
+                cfg,
+                "/recordings/call.mp3",
+                backend=daemon.REMOTE_BACKEND_FTP,
+            )
             self.assertGreaterEqual(mocked_upload.call_count, 2)
             self.assertEqual(saved_doc["stage"], "done")
             self.assertEqual(saved_doc["status"], "ok")
@@ -692,6 +710,23 @@ class ConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(cfg.ftp_archive_dir, "/recordings/sales/archive")
         self.assertFalse(cfg.ftp_archive_dir_explicit)
 
+    def test_from_env_supports_yandex_disk_without_ftp(self):
+        env = {
+            "OPENAI_API_KEY": "sk-test",
+            "TELEGRAM_BOT_TOKEN": "123:test",
+            "TELEGRAM_CHAT_ID": "-1001",
+            "YANDEX_DISK_OAUTH_TOKEN": "y0_test_token",
+            "YANDEX_DISK_REMOTE_ROOT": "/mango/records",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=True):
+            cfg = daemon.Config.from_env()
+
+        self.assertFalse(cfg.ftp_enabled)
+        self.assertTrue(cfg.yandex_disk_enabled)
+        self.assertEqual(cfg.yandex_disk_remote_roots, ["disk:/mango/records"])
+        self.assertEqual(cfg.yandex_disk_remote_root, "disk:/mango/records")
+
 
 class RemoteScanExclusionTests(unittest.TestCase):
     def test_skips_archive_directory_when_archive_is_enabled(self):
@@ -832,6 +867,99 @@ class RemoteWalkTests(unittest.TestCase):
                 mock.call(cfg, "/recordings/nested"),
             ]
         )
+
+    def test_remote_walk_merges_ftp_and_yandex_sources(self):
+        cfg = make_config(
+            ftp_enabled=True,
+            ftp_protocol="sftp",
+            ftp_remote_root="/recordings",
+            ftp_remote_roots=["/recordings"],
+            yandex_disk_enabled=True,
+            yandex_disk_oauth_token="y0_test_token",
+            yandex_disk_remote_root="disk:/recordings",
+            yandex_disk_remote_roots=["disk:/recordings"],
+        )
+        ftp_file = {
+            "backend": daemon.REMOTE_BACKEND_FTP,
+            "path": "/recordings/a.mp3",
+            "name": "a.mp3",
+            "size": 1,
+            "modify": "20260323070000",
+        }
+        yadisk_file = {
+            "backend": daemon.REMOTE_BACKEND_YANDEX_DISK,
+            "path": "disk:/recordings/a.mp3",
+            "name": "a.mp3",
+            "size": 2,
+            "modify": "2026-03-23T07:01:00+00:00",
+        }
+
+        with (
+            mock.patch("callbot_daemon.sftp_walk", return_value=[ftp_file]),
+            mock.patch("callbot_daemon.yandex_disk_walk", return_value=[yadisk_file]),
+        ):
+            files = daemon.remote_walk(cfg)
+
+        self.assertEqual(
+            [daemon.remote_file_lookup_key(item) for item in files],
+            ["/recordings/a.mp3", "yandex_disk:disk:/recordings/a.mp3"],
+        )
+
+    def test_remote_walk_continues_with_yandex_when_ftp_scan_fails(self):
+        cfg = make_config(
+            ftp_enabled=True,
+            ftp_protocol="sftp",
+            ftp_remote_root="/recordings",
+            ftp_remote_roots=["/recordings"],
+            yandex_disk_enabled=True,
+            yandex_disk_oauth_token="y0_test_token",
+            yandex_disk_remote_root="disk:/recordings",
+            yandex_disk_remote_roots=["disk:/recordings"],
+        )
+        yadisk_file = {
+            "backend": daemon.REMOTE_BACKEND_YANDEX_DISK,
+            "path": "disk:/recordings/b.mp3",
+            "name": "b.mp3",
+            "size": 2,
+            "modify": "2026-03-23T07:01:00+00:00",
+        }
+
+        with (
+            mock.patch("callbot_daemon.sftp_walk", side_effect=RuntimeError("FTP down")),
+            mock.patch("callbot_daemon.yandex_disk_walk", return_value=[yadisk_file]),
+        ):
+            files = daemon.remote_walk(cfg)
+
+        self.assertEqual(files, [yadisk_file])
+
+
+class YandexDispatchTests(unittest.TestCase):
+    def test_remote_download_file_uses_yandex_backend(self):
+        cfg = make_config(
+            yandex_disk_enabled=True,
+            yandex_disk_oauth_token="y0_test_token",
+            yandex_disk_remote_root="disk:/recordings",
+            yandex_disk_remote_roots=["disk:/recordings"],
+        )
+        local_path = Path("sample.mp3")
+
+        with (
+            mock.patch("callbot_daemon.yandex_disk_download_file") as mocked_yadisk,
+            mock.patch("callbot_daemon.sftp_download_file") as mocked_sftp,
+        ):
+            daemon.remote_download_file(
+                cfg,
+                "disk:/recordings/sample.mp3",
+                local_path,
+                backend=daemon.REMOTE_BACKEND_YANDEX_DISK,
+            )
+
+        mocked_yadisk.assert_called_once_with(
+            cfg,
+            "disk:/recordings/sample.mp3",
+            local_path,
+        )
+        mocked_sftp.assert_not_called()
 
 
 class ScanCycleTests(unittest.TestCase):

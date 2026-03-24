@@ -45,6 +45,10 @@ AUDIO_EXTENSIONS = {
     ".wav",
     ".webm",
 }
+REMOTE_BACKEND_FTP = "ftp"
+REMOTE_BACKEND_YANDEX_DISK = "yandex_disk"
+YANDEX_DISK_API_BASE_URL = "https://cloud-api.yandex.net/v1/disk"
+YANDEX_DISK_LIST_PAGE_SIZE = 1000
 TELEGRAM_TEXT_LIMIT = 3900
 DEFAULT_TRANSCRIBE_MAX_BYTES = 25 * 1024 * 1024
 DEFAULT_OPENAI_TIMEOUT_SEC = 600.0
@@ -110,6 +114,13 @@ def ensure_parent_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
+def normalize_storage_backend(backend: str = "") -> str:
+    normalized = (backend or REMOTE_BACKEND_FTP).strip().lower()
+    if normalized in {"yandex", "yandex_disk", "yadisk"}:
+        return REMOTE_BACKEND_YANDEX_DISK
+    return REMOTE_BACKEND_FTP
+
+
 def normalize_remote_path(path: str) -> str:
     normalized = posixpath.normpath((path or "/").replace("\\", "/"))
     if not normalized.startswith("/"):
@@ -127,6 +138,30 @@ def normalize_remote_roots(paths: List[str]) -> List[str]:
         seen.add(normalized)
         result.append(normalized)
     return result or ["/"]
+
+
+def normalize_yandex_disk_path(path: str) -> str:
+    raw = (path or "").strip().replace("\\", "/")
+    if not raw:
+        return "disk:/"
+    if raw.startswith("disk:"):
+        raw = raw[5:]
+    normalized = posixpath.normpath(raw if raw.startswith("/") else f"/{raw}")
+    if normalized in {"", "."}:
+        normalized = "/"
+    return f"disk:{normalized}"
+
+
+def normalize_yandex_disk_roots(paths: List[str]) -> List[str]:
+    seen = set()
+    result: List[str] = []
+    for path in paths:
+        normalized = normalize_yandex_disk_path(path)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result or ["disk:/"]
 
 
 def model_supports_reasoning_effort(model: str) -> bool:
@@ -147,57 +182,172 @@ def join_remote_path(base: str, name: str) -> str:
     return normalize_remote_path(posixpath.join(base.rstrip("/"), name))
 
 
+def join_yandex_disk_path(base: str, name: str) -> str:
+    base = normalize_yandex_disk_path(base)
+    suffix = base[5:]
+    if suffix == "/":
+        return normalize_yandex_disk_path(f"/{name}")
+    return normalize_yandex_disk_path(posixpath.join(suffix.rstrip("/"), name))
+
+
+def normalize_source_path(backend: str, path: str) -> str:
+    if normalize_storage_backend(backend) == REMOTE_BACKEND_YANDEX_DISK:
+        return normalize_yandex_disk_path(path)
+    return normalize_remote_path(path)
+
+
+def normalize_source_roots(backend: str, paths: List[str]) -> List[str]:
+    if normalize_storage_backend(backend) == REMOTE_BACKEND_YANDEX_DISK:
+        return normalize_yandex_disk_roots(paths)
+    return normalize_remote_roots(paths)
+
+
+def join_source_path(backend: str, base: str, name: str) -> str:
+    if normalize_storage_backend(backend) == REMOTE_BACKEND_YANDEX_DISK:
+        return join_yandex_disk_path(base, name)
+    return join_remote_path(base, name)
+
+
 def replace_ext(remote_path: str, new_ext: str) -> str:
     base = posixpath.splitext(remote_path)[0]
     return f"{base}{new_ext}"
 
 
-def remote_path_is_within(path: str, directory: str) -> bool:
-    normalized_path = normalize_remote_path(path)
-    normalized_directory = normalize_remote_path(directory)
-    if normalized_directory == "/":
-        return normalized_path == "/"
+def source_path_is_within(backend: str, path: str, directory: str) -> bool:
+    normalized_backend = normalize_storage_backend(backend)
+    normalized_path = normalize_source_path(normalized_backend, path)
+    normalized_directory = normalize_source_path(normalized_backend, directory)
+    root_path = "disk:/" if normalized_backend == REMOTE_BACKEND_YANDEX_DISK else "/"
+    if normalized_directory == root_path:
+        return normalized_path.startswith(root_path)
     return normalized_path == normalized_directory or normalized_path.startswith(
         normalized_directory.rstrip("/") + "/"
     )
 
 
-def resolve_remote_root_for_path(cfg: "Config", remote_path: str) -> str:
-    normalized_path = normalize_remote_path(remote_path)
+def source_remote_root(cfg: "Config", backend: str) -> str:
+    if normalize_storage_backend(backend) == REMOTE_BACKEND_YANDEX_DISK:
+        return cfg.yandex_disk_remote_root
+    return cfg.ftp_remote_root
+
+
+def source_remote_roots(cfg: "Config", backend: str) -> List[str]:
+    if normalize_storage_backend(backend) == REMOTE_BACKEND_YANDEX_DISK:
+        return cfg.yandex_disk_remote_roots
+    return cfg.ftp_remote_roots
+
+
+def source_archive_dir(cfg: "Config", backend: str) -> str:
+    if normalize_storage_backend(backend) == REMOTE_BACKEND_YANDEX_DISK:
+        return cfg.yandex_disk_archive_dir
+    return cfg.ftp_archive_dir
+
+
+def source_archive_dir_explicit(cfg: "Config", backend: str) -> bool:
+    if normalize_storage_backend(backend) == REMOTE_BACKEND_YANDEX_DISK:
+        return cfg.yandex_disk_archive_dir_explicit
+    return cfg.ftp_archive_dir_explicit
+
+
+def source_move_to_archive_after_success(cfg: "Config", backend: str) -> bool:
+    if normalize_storage_backend(backend) == REMOTE_BACKEND_YANDEX_DISK:
+        return cfg.yandex_disk_move_to_archive_after_success
+    return cfg.ftp_move_to_archive_after_success
+
+
+def source_delete_after_success(cfg: "Config", backend: str) -> bool:
+    if normalize_storage_backend(backend) == REMOTE_BACKEND_YANDEX_DISK:
+        return cfg.yandex_disk_delete_after_success
+    return cfg.ftp_delete_after_success
+
+
+def resolve_remote_root_for_path(
+    cfg: "Config",
+    remote_path: str,
+    backend: str = REMOTE_BACKEND_FTP,
+) -> str:
+    normalized_backend = normalize_storage_backend(backend)
+    normalized_path = normalize_source_path(normalized_backend, remote_path)
     matching_roots = [
         root
-        for root in cfg.ftp_remote_roots
-        if remote_path_is_within(normalized_path, root)
+        for root in source_remote_roots(cfg, normalized_backend)
+        if source_path_is_within(normalized_backend, normalized_path, root)
     ]
     if not matching_roots:
-        return normalize_remote_path(cfg.ftp_remote_root)
+        return normalize_source_path(normalized_backend, source_remote_root(cfg, normalized_backend))
     return max(matching_roots, key=len)
 
 
-def resolve_archive_dir_for_path(cfg: "Config", remote_path: str) -> str:
-    if cfg.ftp_archive_dir_explicit:
-        return normalize_remote_path(cfg.ftp_archive_dir)
-    return join_remote_path(resolve_remote_root_for_path(cfg, remote_path), "archive")
-
-
-def iter_scan_archive_dirs(cfg: "Config") -> List[str]:
-    if cfg.ftp_archive_dir_explicit:
-        return [normalize_remote_path(cfg.ftp_archive_dir)]
-    return normalize_remote_roots(
-        [join_remote_path(root, "archive") for root in cfg.ftp_remote_roots]
+def resolve_archive_dir_for_path(
+    cfg: "Config",
+    remote_path: str,
+    backend: str = REMOTE_BACKEND_FTP,
+) -> str:
+    normalized_backend = normalize_storage_backend(backend)
+    if source_archive_dir_explicit(cfg, normalized_backend):
+        return normalize_source_path(normalized_backend, source_archive_dir(cfg, normalized_backend))
+    return join_source_path(
+        normalized_backend,
+        resolve_remote_root_for_path(cfg, remote_path, backend=normalized_backend),
+        "archive",
     )
 
 
-def should_skip_remote_scan_path(cfg: "Config", remote_path: str) -> bool:
-    if not cfg.ftp_move_to_archive_after_success:
+def iter_scan_archive_dirs(
+    cfg: "Config",
+    backend: str = REMOTE_BACKEND_FTP,
+) -> List[str]:
+    normalized_backend = normalize_storage_backend(backend)
+    if source_archive_dir_explicit(cfg, normalized_backend):
+        return [
+            normalize_source_path(
+                normalized_backend,
+                source_archive_dir(cfg, normalized_backend),
+            )
+        ]
+    return normalize_source_roots(
+        normalized_backend,
+        [
+            join_source_path(normalized_backend, root, "archive")
+            for root in source_remote_roots(cfg, normalized_backend)
+        ],
+    )
+
+
+def should_skip_remote_scan_path(
+    cfg: "Config",
+    remote_path: str,
+    backend: str = REMOTE_BACKEND_FTP,
+) -> bool:
+    normalized_backend = normalize_storage_backend(backend)
+    if not source_move_to_archive_after_success(cfg, normalized_backend):
         return False
-    remote_roots = {normalize_remote_path(root) for root in cfg.ftp_remote_roots}
-    for archive_dir in iter_scan_archive_dirs(cfg):
+    remote_roots = {
+        normalize_source_path(normalized_backend, root)
+        for root in source_remote_roots(cfg, normalized_backend)
+    }
+    for archive_dir in iter_scan_archive_dirs(cfg, backend=normalized_backend):
         if archive_dir in remote_roots:
             continue
-        if remote_path_is_within(remote_path, archive_dir):
+        if source_path_is_within(normalized_backend, remote_path, archive_dir):
             return True
     return False
+
+
+def remote_lookup_key(backend: str, remote_path: str) -> str:
+    normalized_backend = normalize_storage_backend(backend)
+    normalized_path = normalize_source_path(normalized_backend, remote_path)
+    if normalized_backend == REMOTE_BACKEND_FTP:
+        return normalized_path
+    return f"{normalized_backend}:{normalized_path}"
+
+
+def remote_file_backend(remote_file: Dict[str, Any]) -> str:
+    return normalize_storage_backend(str(remote_file.get("backend") or REMOTE_BACKEND_FTP))
+
+
+def remote_file_lookup_key(remote_file: Dict[str, Any]) -> str:
+    return remote_lookup_key(remote_file_backend(remote_file), str(remote_file["path"]))
 
 
 def parse_ftp_modify(raw: Optional[str]) -> Optional[datetime]:
@@ -208,7 +358,13 @@ def parse_ftp_modify(raw: Optional[str]) -> Optional[datetime]:
             tzinfo=timezone.utc
         )
     except ValueError:
-        return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
 
 def response_to_dict(obj: Any) -> Dict[str, Any]:
@@ -456,6 +612,7 @@ def safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
 
 @dataclass
 class Config:
+    ftp_enabled: bool
     ftp_protocol: str
     ftp_host: str
     ftp_port: int
@@ -473,6 +630,15 @@ class Config:
     ftp_timeout_sec: int
     ftp_connect_attempts: int
     ftp_retry_delay_sec: float
+    yandex_disk_enabled: bool
+    yandex_disk_oauth_token: str
+    yandex_disk_timeout_sec: int
+    yandex_disk_remote_root: str
+    yandex_disk_remote_roots: List[str]
+    yandex_disk_archive_dir: str
+    yandex_disk_archive_dir_explicit: bool
+    yandex_disk_delete_after_success: bool
+    yandex_disk_move_to_archive_after_success: bool
     openai_api_key: str
     openai_base_url: str
     openai_proxy: str
@@ -519,22 +685,91 @@ class Config:
             or os.getenv("FTP_USERNAME")
             or ""
         ).strip()
-        ftp_remote_roots = normalize_remote_roots(
-            env_csv("FTP_REMOTE_ROOTS")
-            or [
-                (
-                    os.getenv("FTP_REMOTE_ROOT")
-                    or os.getenv("FTP_REMOTE_DIR")
+        ftp_host = (os.getenv("FTP_HOST") or "").strip()
+        ftp_password = os.getenv("FTP_PASSWORD") or ""
+        ftp_requested = bool(
+            ftp_host
+            or ftp_password
+            or ftp_user
+            or (os.getenv("FTP_REMOTE_ROOT") or "").strip()
+            or env_csv("FTP_REMOTE_ROOTS")
+        )
+        ftp_enabled = bool(ftp_host and ftp_password and ftp_user)
+        if ftp_requested and not ftp_enabled:
+            raise ValueError(
+                "FTP source is partially configured. Set FTP_HOST, FTP_USER/FTP_USERNAME, "
+                "and FTP_PASSWORD, or clear the FTP_* variables."
+            )
+        if ftp_enabled:
+            ftp_remote_roots = normalize_remote_roots(
+                env_csv("FTP_REMOTE_ROOTS")
+                or [
+                    (
+                        os.getenv("FTP_REMOTE_ROOT")
+                        or os.getenv("FTP_REMOTE_DIR")
+                        or "/"
+                    ).strip()
                     or "/"
-                ).strip()
-                or "/"
-            ]
+                ]
+            )
+            ftp_remote_root = ftp_remote_roots[0]
+            ftp_archive_dir_raw = (os.getenv("FTP_ARCHIVE_DIR") or "").strip()
+            ftp_archive_dir = normalize_remote_path(
+                ftp_archive_dir_raw or join_remote_path(ftp_remote_root, "archive")
+            )
+        else:
+            ftp_remote_roots = []
+            ftp_remote_root = "/"
+            ftp_archive_dir_raw = ""
+            ftp_archive_dir = "/archive"
+
+        yandex_disk_oauth_token = (
+            os.getenv("YANDEX_DISK_OAUTH_TOKEN")
+            or os.getenv("YANDEX_DISK_TOKEN")
+            or ""
+        ).strip()
+        yandex_disk_roots_raw = env_csv("YANDEX_DISK_REMOTE_ROOTS")
+        yandex_disk_root_single = (
+            os.getenv("YANDEX_DISK_REMOTE_ROOT")
+            or os.getenv("YANDEX_DISK_ROOT")
+            or ""
+        ).strip()
+        yandex_disk_requested = bool(
+            yandex_disk_oauth_token
+            or yandex_disk_roots_raw
+            or yandex_disk_root_single
+            or (os.getenv("YANDEX_DISK_ARCHIVE_DIR") or "").strip()
         )
-        ftp_remote_root = ftp_remote_roots[0]
-        ftp_archive_dir_raw = (os.getenv("FTP_ARCHIVE_DIR") or "").strip()
-        ftp_archive_dir = normalize_remote_path(
-            ftp_archive_dir_raw or join_remote_path(ftp_remote_root, "archive")
+        yandex_disk_remote_roots = (
+            normalize_yandex_disk_roots(
+                yandex_disk_roots_raw
+                or ([yandex_disk_root_single] if yandex_disk_root_single else [])
+            )
+            if (yandex_disk_roots_raw or yandex_disk_root_single)
+            else []
         )
+        yandex_disk_enabled = bool(
+            yandex_disk_oauth_token and yandex_disk_remote_roots
+        )
+        if yandex_disk_requested and not yandex_disk_enabled:
+            raise ValueError(
+                "Yandex Disk source is partially configured. Set "
+                "YANDEX_DISK_OAUTH_TOKEN and YANDEX_DISK_REMOTE_ROOT/ROOTS, "
+                "or clear the YANDEX_DISK_* variables."
+            )
+        if yandex_disk_enabled:
+            yandex_disk_remote_root = yandex_disk_remote_roots[0]
+            yandex_disk_archive_dir_raw = (
+                os.getenv("YANDEX_DISK_ARCHIVE_DIR") or ""
+            ).strip()
+            yandex_disk_archive_dir = normalize_yandex_disk_path(
+                yandex_disk_archive_dir_raw
+                or join_yandex_disk_path(yandex_disk_remote_root, "archive")
+            )
+        else:
+            yandex_disk_remote_root = "disk:/"
+            yandex_disk_archive_dir_raw = ""
+            yandex_disk_archive_dir = "disk:/archive"
         transcribe_model = os.getenv(
             "OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe-diarize"
         ).strip()
@@ -544,11 +779,12 @@ class Config:
         ).strip()
         ftp_port_default = "22" if ftp_protocol == "sftp" else "21"
         return cls(
+            ftp_enabled=ftp_enabled,
             ftp_protocol=ftp_protocol,
-            ftp_host=os.environ["FTP_HOST"],
+            ftp_host=ftp_host,
             ftp_port=int(os.getenv("FTP_PORT", ftp_port_default)),
-            ftp_user=ftp_user or os.environ["FTP_USER"],
-            ftp_password=os.environ["FTP_PASSWORD"],
+            ftp_user=ftp_user,
+            ftp_password=ftp_password,
             ftp_encoding=os.getenv("FTP_ENCODING", "utf-8").strip() or "utf-8",
             ftp_encoding_fallbacks=env_csv(
                 "FTP_ENCODING_FALLBACKS",
@@ -569,6 +805,23 @@ class Config:
             ),
             ftp_retry_delay_sec=max(
                 0.0, float(os.getenv("FTP_RETRY_DELAY_SEC", "5"))
+            ),
+            yandex_disk_enabled=yandex_disk_enabled,
+            yandex_disk_oauth_token=yandex_disk_oauth_token,
+            yandex_disk_timeout_sec=int(
+                os.getenv("YANDEX_DISK_TIMEOUT_SEC", "120")
+            ),
+            yandex_disk_remote_root=yandex_disk_remote_root,
+            yandex_disk_remote_roots=yandex_disk_remote_roots,
+            yandex_disk_archive_dir=yandex_disk_archive_dir,
+            yandex_disk_archive_dir_explicit=bool(yandex_disk_archive_dir_raw),
+            yandex_disk_delete_after_success=env_bool(
+                "YANDEX_DISK_DELETE_AFTER_SUCCESS",
+                False,
+            ),
+            yandex_disk_move_to_archive_after_success=env_bool(
+                "YANDEX_DISK_MOVE_TO_ARCHIVE_AFTER_SUCCESS",
+                False,
             ),
             openai_api_key=os.environ["OPENAI_API_KEY"],
             openai_base_url=os.getenv("OPENAI_BASE_URL", "").strip(),
@@ -1055,6 +1308,16 @@ class RemoteConnectionError(RuntimeError):
 
 
 def is_retryable_remote_error(exc: Exception) -> bool:
+    if isinstance(exc, requests.exceptions.Timeout):
+        return True
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return True
+    if isinstance(exc, requests.exceptions.HTTPError):
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        return isinstance(status_code, int) and (
+            status_code in {408, 409, 429} or status_code >= 500
+        )
     if isinstance(exc, TimeoutError):
         return True
     if isinstance(exc, EOFError):
@@ -1228,6 +1491,7 @@ def sftp_walk(cfg: Config, root: str) -> List[Dict[str, Any]]:
                 continue
             result.append(
                 {
+                    "backend": REMOTE_BACKEND_FTP,
                     "name": name,
                     "path": full_path,
                     "size": int(entry.st_size),
@@ -1293,6 +1557,292 @@ def sftp_upload_json(cfg: Config, remote_path: str, payload: Dict[str, Any]) -> 
             sftp.close()
         finally:
             transport.close()
+
+
+def build_yandex_disk_headers(cfg: Config) -> Dict[str, str]:
+    return {"Authorization": f"OAuth {cfg.yandex_disk_oauth_token}"}
+
+
+def run_yandex_disk_request(
+    cfg: Config,
+    method: str,
+    path_or_url: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    data: Any = None,
+    headers: Optional[Dict[str, str]] = None,
+    stream: bool = False,
+    absolute_url: bool = False,
+    allowed_status_codes: Optional[List[int]] = None,
+) -> requests.Response:
+    url = path_or_url if absolute_url else f"{YANDEX_DISK_API_BASE_URL}{path_or_url}"
+    request_headers = build_yandex_disk_headers(cfg)
+    if headers:
+        request_headers.update(headers)
+    allowed = set(allowed_status_codes or [])
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, cfg.ftp_connect_attempts + 1):
+        response: Optional[requests.Response] = None
+        try:
+            response = requests.request(
+                method,
+                url,
+                headers=request_headers,
+                params=params,
+                data=data,
+                timeout=cfg.yandex_disk_timeout_sec,
+                stream=stream,
+            )
+            if response.status_code in allowed:
+                return response
+            response.raise_for_status()
+            return response
+        except KeyboardInterrupt:
+            if response is not None:
+                response.close()
+            raise
+        except Exception as exc:
+            if response is not None:
+                response.close()
+            last_exc = exc
+            if not is_retryable_remote_error(exc) or attempt >= cfg.ftp_connect_attempts:
+                raise
+            logging.warning(
+                "Yandex Disk request attempt %s/%s failed: %s %s (%s). "
+                "Retrying in %.1f sec.",
+                attempt,
+                cfg.ftp_connect_attempts,
+                method.upper(),
+                url,
+                exc,
+                cfg.ftp_retry_delay_sec,
+            )
+            time.sleep(cfg.ftp_retry_delay_sec)
+
+    raise RemoteConnectionError(
+        "Yandex Disk request failed without a terminal response"
+    ) from last_exc
+
+
+def yandex_disk_get_resource_href(
+    cfg: Config,
+    endpoint: str,
+    remote_path: str,
+    extra_params: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    response = run_yandex_disk_request(
+        cfg,
+        "GET",
+        endpoint,
+        params={
+            "path": normalize_yandex_disk_path(remote_path),
+            **(extra_params or {}),
+        },
+        allowed_status_codes=[404],
+    )
+    try:
+        if response.status_code == 404:
+            return None
+        data = response.json()
+    finally:
+        response.close()
+
+    href = str(data.get("href") or "").strip() if isinstance(data, dict) else ""
+    if not href:
+        raise RuntimeError(
+            f"Yandex Disk API did not return a transfer href for {remote_path}"
+        )
+    return href
+
+
+def yandex_disk_ensure_dir(cfg: Config, directory: str) -> None:
+    response = run_yandex_disk_request(
+        cfg,
+        "PUT",
+        "/resources",
+        params={"path": normalize_yandex_disk_path(directory)},
+        allowed_status_codes=[201, 409],
+    )
+    response.close()
+
+
+def yandex_disk_walk(cfg: Config, root: str) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+
+    def walk(path: str) -> None:
+        normalized_path = normalize_yandex_disk_path(path)
+        offset = 0
+        while True:
+            response = run_yandex_disk_request(
+                cfg,
+                "GET",
+                "/resources",
+                params={
+                    "path": normalized_path,
+                    "limit": YANDEX_DISK_LIST_PAGE_SIZE,
+                    "offset": offset,
+                },
+            )
+            try:
+                data = response.json()
+            finally:
+                response.close()
+
+            embedded = data.get("_embedded") if isinstance(data, dict) else {}
+            if not isinstance(embedded, dict):
+                embedded = {}
+            items = embedded.get("items") or []
+            if not isinstance(items, list):
+                items = []
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                full_path = normalize_yandex_disk_path(
+                    str(
+                        item.get("path")
+                        or join_yandex_disk_path(
+                            normalized_path,
+                            str(item.get("name") or ""),
+                        )
+                    )
+                )
+                if should_skip_remote_scan_path(
+                    cfg,
+                    full_path,
+                    backend=REMOTE_BACKEND_YANDEX_DISK,
+                ):
+                    continue
+                item_type = str(item.get("type") or "").strip().lower()
+                if item_type == "dir":
+                    walk(full_path)
+                    continue
+                if item_type != "file":
+                    continue
+                result.append(
+                    {
+                        "backend": REMOTE_BACKEND_YANDEX_DISK,
+                        "name": str(item.get("name") or posixpath.basename(full_path)),
+                        "path": full_path,
+                        "size": int(item.get("size") or 0),
+                        "modify": str(item.get("modified") or "").strip() or None,
+                    }
+                )
+
+            total = int(embedded.get("total") or len(items))
+            if not items:
+                break
+            offset += len(items)
+            if offset >= total:
+                break
+
+    walk(root)
+    return result
+
+
+def yandex_disk_download_file(cfg: Config, remote_path: str, local_path: Path) -> None:
+    href = yandex_disk_get_resource_href(cfg, "/resources/download", remote_path)
+    if not href:
+        raise FileNotFoundError(remote_path)
+    ensure_parent_dir(local_path)
+    response = run_yandex_disk_request(
+        cfg,
+        "GET",
+        href,
+        stream=True,
+        absolute_url=True,
+    )
+    try:
+        with local_path.open("wb") as out:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    out.write(chunk)
+    finally:
+        response.close()
+
+
+def yandex_disk_load_json(cfg: Config, remote_path: str) -> Optional[Dict[str, Any]]:
+    href = yandex_disk_get_resource_href(cfg, "/resources/download", remote_path)
+    if not href:
+        return None
+    response = run_yandex_disk_request(
+        cfg,
+        "GET",
+        href,
+        absolute_url=True,
+        stream=True,
+    )
+    try:
+        raw = response.content
+    finally:
+        response.close()
+
+    try:
+        decoded = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        logging.exception("Could not decode remote JSON as UTF-8: %s", remote_path)
+        return None
+    return parse_json_text(decoded, remote_path)
+
+
+def yandex_disk_upload_json(cfg: Config, remote_path: str, payload: Dict[str, Any]) -> None:
+    content = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    normalized_path = normalize_yandex_disk_path(remote_path)
+    yandex_disk_ensure_dir(
+        cfg,
+        normalize_yandex_disk_path(posixpath.dirname(normalized_path) or "disk:/"),
+    )
+    href = yandex_disk_get_resource_href(
+        cfg,
+        "/resources/upload",
+        normalized_path,
+        extra_params={"overwrite": "true"},
+    )
+    if not href:
+        raise RuntimeError(f"Could not get Yandex Disk upload URL for {remote_path}")
+    response = run_yandex_disk_request(
+        cfg,
+        "PUT",
+        href,
+        data=content,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        absolute_url=True,
+        allowed_status_codes=[201, 202],
+    )
+    response.close()
+
+
+def yandex_disk_move(cfg: Config, source_path: str, destination_path: str) -> int:
+    response = run_yandex_disk_request(
+        cfg,
+        "POST",
+        "/resources/move",
+        params={
+            "from": normalize_yandex_disk_path(source_path),
+            "path": normalize_yandex_disk_path(destination_path),
+            "overwrite": "false",
+        },
+        allowed_status_codes=[201, 202, 409],
+    )
+    try:
+        return response.status_code
+    finally:
+        response.close()
+
+
+def yandex_disk_delete(cfg: Config, remote_path: str) -> None:
+    response = run_yandex_disk_request(
+        cfg,
+        "DELETE",
+        "/resources",
+        params={
+            "path": normalize_yandex_disk_path(remote_path),
+            "permanently": "true",
+        },
+        allowed_status_codes=[202, 204],
+    )
+    response.close()
 
 
 def is_mlsd_unsupported(exc: BaseException) -> bool:
@@ -1365,6 +1915,7 @@ def ftp_walk_mlsd(ftp, root: str, cfg: Config) -> List[Dict[str, Any]]:
                 continue
             result.append(
                 {
+                    "backend": REMOTE_BACKEND_FTP,
                     "name": name,
                     "path": full_path,
                     "size": int(facts.get("size") or 0),
@@ -1419,6 +1970,7 @@ def ftp_walk_nlst(ftp, root: str, cfg: Config) -> List[Dict[str, Any]]:
                 continue
             result.append(
                 {
+                    "backend": REMOTE_BACKEND_FTP,
                     "name": name,
                     "path": full_path,
                     "size": safe_ftp_size(ftp, full_path),
@@ -1460,77 +2012,153 @@ def iter_ftp_encodings(cfg: Config) -> List[str]:
 def dedupe_remote_files(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen_paths = set()
     result: List[Dict[str, Any]] = []
-    for item in sorted(files, key=lambda entry: entry["path"]):
-        remote_path = item["path"]
-        if remote_path in seen_paths:
+    for item in sorted(files, key=remote_file_lookup_key):
+        lookup_key = remote_file_lookup_key(item)
+        if lookup_key in seen_paths:
             continue
-        seen_paths.add(remote_path)
+        seen_paths.add(lookup_key)
         result.append(item)
     return result
 
 
 def remote_walk(cfg: Config) -> List[Dict[str, Any]]:
-    if cfg.ftp_protocol == "sftp":
-        files: List[Dict[str, Any]] = []
-        for root in cfg.ftp_remote_roots:
-            files.extend(sftp_walk(cfg, root))
-        return dedupe_remote_files(files)
+    files: List[Dict[str, Any]] = []
+    ftp_scan_succeeded = False
+    yandex_scan_succeeded = False
+    source_errors: List[Exception] = []
 
-    decode_errors: List[UnicodeDecodeError] = []
-    for encoding in iter_ftp_encodings(cfg):
+    if cfg.ftp_enabled:
         try:
-            with closing(ftp_connect(cfg, encoding=encoding)) as ftp:
-                files: List[Dict[str, Any]] = []
+            if cfg.ftp_protocol == "sftp":
                 for root in cfg.ftp_remote_roots:
-                    files.extend(ftp_walk(ftp, root, cfg))
-            if encoding.lower() != cfg.ftp_encoding.lower():
-                logging.warning(
-                    "FTP listing is not valid %s; switched runtime encoding to %s. "
-                    "Set FTP_ENCODING=%s to make it permanent.",
-                    cfg.ftp_encoding,
-                    encoding,
-                    encoding,
-                )
-                cfg.ftp_encoding = encoding
-            return dedupe_remote_files(files)
-        except UnicodeDecodeError as exc:
-            decode_errors.append(exc)
-            logging.warning(
-                "FTP listing decode failed with %s: %s",
-                encoding,
-                exc,
-            )
+                    files.extend(sftp_walk(cfg, root))
+                ftp_scan_succeeded = True
+            else:
+                decode_errors: List[UnicodeDecodeError] = []
+                for encoding in iter_ftp_encodings(cfg):
+                    try:
+                        with closing(ftp_connect(cfg, encoding=encoding)) as ftp:
+                            for root in cfg.ftp_remote_roots:
+                                files.extend(ftp_walk(ftp, root, cfg))
+                        ftp_scan_succeeded = True
+                        if encoding.lower() != cfg.ftp_encoding.lower():
+                            logging.warning(
+                                "FTP listing is not valid %s; switched runtime encoding to %s. "
+                                "Set FTP_ENCODING=%s to make it permanent.",
+                                cfg.ftp_encoding,
+                                encoding,
+                                encoding,
+                            )
+                            cfg.ftp_encoding = encoding
+                        break
+                    except UnicodeDecodeError as exc:
+                        decode_errors.append(exc)
+                        logging.warning(
+                            "FTP listing decode failed with %s: %s",
+                            encoding,
+                            exc,
+                        )
 
-    if decode_errors:
-        raise decode_errors[-1]
-    raise RuntimeError("FTP listing failed before any encoding candidates were tried")
+                if decode_errors and not ftp_scan_succeeded:
+                    raise decode_errors[-1]
+        except Exception as exc:
+            source_errors.append(exc)
+            logging.warning("FTP/SFTP scan skipped: %s", exc)
+
+    if cfg.yandex_disk_enabled:
+        try:
+            for root in cfg.yandex_disk_remote_roots:
+                files.extend(yandex_disk_walk(cfg, root))
+            yandex_scan_succeeded = True
+        except Exception as exc:
+            source_errors.append(exc)
+            logging.warning("Yandex Disk scan skipped: %s", exc)
+
+    if files:
+        return dedupe_remote_files(files)
+    if ftp_scan_succeeded or yandex_scan_succeeded:
+        return []
+    if source_errors:
+        raise source_errors[0]
+    return []
 
 
-def remote_download_file(cfg: Config, remote_path: str, local_path: Path) -> None:
+def remote_download_file(
+    cfg: Config,
+    remote_path: str,
+    local_path: Path,
+    backend: str = REMOTE_BACKEND_FTP,
+) -> None:
+    normalized_backend = normalize_storage_backend(backend)
+    if normalized_backend == REMOTE_BACKEND_YANDEX_DISK:
+        yandex_disk_download_file(cfg, remote_path, local_path)
+        return
     if cfg.ftp_protocol == "sftp":
         sftp_download_file(cfg, remote_path, local_path)
         return
     ftp_download_file(cfg, remote_path, local_path)
 
 
-def remote_upload_json(cfg: Config, remote_path: str, payload: Dict[str, Any]) -> None:
+def remote_upload_json(
+    cfg: Config,
+    remote_path: str,
+    payload: Dict[str, Any],
+    backend: str = REMOTE_BACKEND_FTP,
+) -> None:
+    normalized_backend = normalize_storage_backend(backend)
+    if normalized_backend == REMOTE_BACKEND_YANDEX_DISK:
+        yandex_disk_upload_json(cfg, remote_path, payload)
+        return
     if cfg.ftp_protocol == "sftp":
         sftp_upload_json(cfg, remote_path, payload)
         return
     ftp_upload_json(cfg, remote_path, payload)
 
 
-def remote_load_json(cfg: Config, remote_path: str) -> Optional[Dict[str, Any]]:
+def remote_load_json(
+    cfg: Config,
+    remote_path: str,
+    backend: str = REMOTE_BACKEND_FTP,
+) -> Optional[Dict[str, Any]]:
+    normalized_backend = normalize_storage_backend(backend)
+    if normalized_backend == REMOTE_BACKEND_YANDEX_DISK:
+        return yandex_disk_load_json(cfg, remote_path)
     if cfg.ftp_protocol == "sftp":
         return sftp_load_json(cfg, remote_path)
     return ftp_load_json(cfg, remote_path)
 
 
-def remote_archive_or_delete(cfg: Config, remote_path: str) -> None:
-    if cfg.ftp_move_to_archive_after_success:
-        archive_dir = resolve_archive_dir_for_path(cfg, remote_path)
+def remote_archive_or_delete(
+    cfg: Config,
+    remote_path: str,
+    backend: str = REMOTE_BACKEND_FTP,
+) -> None:
+    normalized_backend = normalize_storage_backend(backend)
+    if source_move_to_archive_after_success(cfg, normalized_backend):
+        archive_dir = resolve_archive_dir_for_path(
+            cfg,
+            remote_path,
+            backend=normalized_backend,
+        )
         destination_name = posixpath.basename(remote_path)
-        destination_path = join_remote_path(archive_dir, destination_name)
+        destination_path = join_source_path(
+            normalized_backend,
+            archive_dir,
+            destination_name,
+        )
+        if normalized_backend == REMOTE_BACKEND_YANDEX_DISK:
+            yandex_disk_ensure_dir(cfg, archive_dir)
+            status_code = yandex_disk_move(cfg, remote_path, destination_path)
+            if status_code == 409:
+                stem, suffix = posixpath.splitext(destination_name)
+                destination_path = join_source_path(
+                    normalized_backend,
+                    archive_dir,
+                    f"{stem}__{int(time.time())}{suffix}",
+                )
+                yandex_disk_move(cfg, remote_path, destination_path)
+            return
+
         if cfg.ftp_protocol == "sftp":
             transport, sftp = sftp_connect(cfg)
             try:
@@ -1564,7 +2192,11 @@ def remote_archive_or_delete(cfg: Config, remote_path: str) -> None:
                 ftp.rename(remote_path, destination_path)
         return
 
-    if not cfg.ftp_delete_after_success:
+    if not source_delete_after_success(cfg, normalized_backend):
+        return
+
+    if normalized_backend == REMOTE_BACKEND_YANDEX_DISK:
+        yandex_disk_delete(cfg, remote_path)
         return
 
     if cfg.ftp_protocol == "sftp":
@@ -1854,20 +2486,37 @@ def parse_filename_metadata(filename: str) -> Dict[str, Optional[str]]:
 def document_matches_remote_audio(
     transcript_doc: Optional[Dict[str, Any]],
     remote_audio_path: str,
+    remote_backend: str = REMOTE_BACKEND_FTP,
 ) -> bool:
     if not isinstance(transcript_doc, dict):
         return False
     source = transcript_doc.get("source")
     if not isinstance(source, dict):
         return False
-    return str(source.get("ftp_path_audio") or "").strip() == remote_audio_path
+    source_backend = normalize_storage_backend(
+        str(source.get("storage_backend") or REMOTE_BACKEND_FTP)
+    )
+    source_path = str(
+        source.get("source_path_audio")
+        or source.get("ftp_path_audio")
+        or ""
+    ).strip()
+    return (
+        source_backend == normalize_storage_backend(remote_backend)
+        and source_path == remote_audio_path
+    )
 
 
 def extract_saved_transcription_doc(
     transcript_doc: Optional[Dict[str, Any]],
     remote_audio_path: str,
+    remote_backend: str = REMOTE_BACKEND_FTP,
 ) -> Optional[Dict[str, Any]]:
-    if not document_matches_remote_audio(transcript_doc, remote_audio_path):
+    if not document_matches_remote_audio(
+        transcript_doc,
+        remote_audio_path,
+        remote_backend=remote_backend,
+    ):
         return None
 
     stage = str((transcript_doc or {}).get("stage") or "").strip().lower()
@@ -1906,8 +2555,13 @@ def extract_saved_transcription_doc(
 def classify_saved_remote_json(
     transcript_doc: Optional[Dict[str, Any]],
     remote_audio_path: str,
+    remote_backend: str = REMOTE_BACKEND_FTP,
 ) -> str:
-    if not document_matches_remote_audio(transcript_doc, remote_audio_path):
+    if not document_matches_remote_audio(
+        transcript_doc,
+        remote_audio_path,
+        remote_backend=remote_backend,
+    ):
         return "unknown"
 
     stage = str((transcript_doc or {}).get("stage") or "").strip().lower()
@@ -1917,9 +2571,17 @@ def classify_saved_remote_json(
         return "completed"
     if stage == "done":
         return "completed"
-    if extract_saved_telegram_message(transcript_doc, remote_audio_path):
+    if extract_saved_telegram_message(
+        transcript_doc,
+        remote_audio_path,
+        remote_backend=remote_backend,
+    ):
         return "retry_telegram"
-    if extract_saved_transcription_doc(transcript_doc, remote_audio_path):
+    if extract_saved_transcription_doc(
+        transcript_doc,
+        remote_audio_path,
+        remote_backend=remote_backend,
+    ):
         return "resume_from_transcription"
     if stage in {"processing", "transcribed", "analyzed", "error"}:
         return "retry"
@@ -1963,12 +2625,15 @@ def build_skip_document(
     status: str,
     reason: str,
 ) -> Dict[str, Any]:
+    remote_backend = remote_file_backend(remote_file)
     return {
         "generated_at": now_iso(),
         "stage": "done",
         "status": status,
         "error": reason,
         "source": {
+            "storage_backend": remote_backend,
+            "source_path_audio": remote_file["path"],
             "ftp_path_audio": remote_file["path"],
             "file_name_audio": remote_file["name"],
             "file_size_bytes": remote_file["size"],
@@ -1993,12 +2658,15 @@ def build_error_document(
     remote_file: Dict[str, Any],
     error_details: Dict[str, Any],
 ) -> Dict[str, Any]:
+    remote_backend = remote_file_backend(remote_file)
     return {
         "generated_at": now_iso(),
         "stage": "error",
         "status": "error",
         "error": error_details,
         "source": {
+            "storage_backend": remote_backend,
+            "source_path_audio": remote_file["path"],
             "ftp_path_audio": remote_file["path"],
             "file_name_audio": remote_file["name"],
             "file_size_bytes": remote_file["size"],
@@ -2080,6 +2748,7 @@ def build_transcript_document(
     split_applied: Optional[bool] = None,
 ) -> Dict[str, Any]:
     metadata = parse_filename_metadata(remote_file["name"])
+    remote_backend = remote_file_backend(remote_file)
     full_parts: List[str] = []
     all_segments: List[Dict[str, Any]] = []
     total_duration_sec = 0.0
@@ -2145,6 +2814,8 @@ def build_transcript_document(
         "stage": "transcribed",
         "status": "transcribed",
         "source": {
+            "storage_backend": remote_backend,
+            "source_path_audio": remote_file["path"],
             "ftp_path_audio": remote_file["path"],
             "file_name_audio": remote_file["name"],
             "file_size_bytes": remote_file["size"],
@@ -2574,8 +3245,13 @@ def describe_telegram_failure(
 def extract_saved_telegram_message(
     transcript_doc: Optional[Dict[str, Any]],
     remote_audio_path: str,
+    remote_backend: str = REMOTE_BACKEND_FTP,
 ) -> str:
-    if not document_matches_remote_audio(transcript_doc, remote_audio_path):
+    if not document_matches_remote_audio(
+        transcript_doc,
+        remote_audio_path,
+        remote_backend=remote_backend,
+    ):
         return ""
 
     telegram = transcript_doc.get("telegram")
@@ -2649,9 +3325,10 @@ def process_remote_audio(
     state: Dict[str, Any],
     remote_file: Dict[str, Any],
 ) -> None:
+    remote_backend = remote_file_backend(remote_file)
     remote_audio_path = remote_file["path"]
     remote_json_path = replace_ext(remote_audio_path, ".json")
-    entry = state["files"].setdefault(remote_audio_path, {})
+    entry = state["files"].setdefault(remote_file_lookup_key(remote_file), {})
     entry["stage"] = "processing"
     entry["last_started_at"] = now_iso()
     entry["last_error"] = None
@@ -2662,10 +3339,11 @@ def process_remote_audio(
 
     transcript_doc: Optional[Dict[str, Any]] = None
     try:
-        transcript_doc = remote_load_json(cfg, remote_json_path)
+        transcript_doc = remote_load_json(cfg, remote_json_path, backend=remote_backend)
         reusable_telegram_message = extract_saved_telegram_message(
             transcript_doc,
             remote_audio_path,
+            remote_backend=remote_backend,
         )
         if reusable_telegram_message:
             logging.info(
@@ -2684,14 +3362,23 @@ def process_remote_audio(
             }
             transcript_doc["stage"] = "done"
             transcript_doc["status"] = "ok"
-            remote_upload_json(cfg, remote_json_path, transcript_doc)
+            remote_upload_json(
+                cfg,
+                remote_json_path,
+                transcript_doc,
+                backend=remote_backend,
+            )
 
             entry["stage"] = "done"
             entry["processed_sig"] = entry.get("last_sig")
             entry["last_finished_at"] = now_iso()
             save_state(cfg.state_path, state)
             try:
-                remote_archive_or_delete(cfg, remote_audio_path)
+                remote_archive_or_delete(
+                    cfg,
+                    remote_audio_path,
+                    backend=remote_backend,
+                )
             except Exception:
                 logging.exception(
                     "Could not archive/delete remote audio after Telegram retry success: %s",
@@ -2703,6 +3390,7 @@ def process_remote_audio(
         reusable_transcript_doc = extract_saved_transcription_doc(
             transcript_doc,
             remote_audio_path,
+            remote_backend=remote_backend,
         )
         if reusable_transcript_doc is not None:
             transcript_doc = reusable_transcript_doc
@@ -2716,7 +3404,12 @@ def process_remote_audio(
                 local_audio = tmp_dir / remote_file["name"]
 
                 logging.info("Downloading audio: %s", remote_audio_path)
-                remote_download_file(cfg, remote_audio_path, local_audio)
+                remote_download_file(
+                    cfg,
+                    remote_audio_path,
+                    local_audio,
+                    backend=remote_backend,
+                )
 
                 logging.info("Normalizing audio: %s", local_audio.name)
                 audio_parts = prepare_audio_parts(local_audio, tmp_dir, cfg)
@@ -2788,7 +3481,12 @@ def process_remote_audio(
                     planned_parts_count=len(part_descriptors),
                     split_applied=len(part_descriptors) > 1,
                 )
-            remote_upload_json(cfg, remote_json_path, transcript_doc)
+            remote_upload_json(
+                cfg,
+                remote_json_path,
+                transcript_doc,
+                backend=remote_backend,
+            )
 
         word_count = int(transcript_doc["transcription"].get("word_count") or 0)
         duration_min = float(
@@ -2819,7 +3517,12 @@ def process_remote_audio(
             }
             transcript_doc["stage"] = "done"
             transcript_doc["status"] = "ok"
-            remote_upload_json(cfg, remote_json_path, transcript_doc)
+            remote_upload_json(
+                cfg,
+                remote_json_path,
+                transcript_doc,
+                backend=remote_backend,
+            )
 
             entry["stage"] = "done"
             entry["processed_sig"] = entry.get("last_sig")
@@ -2827,7 +3530,11 @@ def process_remote_audio(
             entry["skip_reason"] = "; ".join(skip_reasons)
             save_state(cfg.state_path, state)
             try:
-                remote_archive_or_delete(cfg, remote_audio_path)
+                remote_archive_or_delete(
+                    cfg,
+                    remote_audio_path,
+                    backend=remote_backend,
+                )
             except Exception:
                 logging.exception(
                     "Could not archive/delete remote audio after analysis skip: %s",
@@ -2857,7 +3564,12 @@ def process_remote_audio(
         }
         transcript_doc["stage"] = "analyzed"
         transcript_doc["status"] = "analyzed"
-        remote_upload_json(cfg, remote_json_path, transcript_doc)
+        remote_upload_json(
+            cfg,
+            remote_json_path,
+            transcript_doc,
+            backend=remote_backend,
+        )
 
         logging.info("Sending Telegram message: %s", remote_audio_path)
         telegram_results = send_telegram_message(cfg, telegram_message)
@@ -2871,14 +3583,23 @@ def process_remote_audio(
         }
         transcript_doc["stage"] = "done"
         transcript_doc["status"] = "ok"
-        remote_upload_json(cfg, remote_json_path, transcript_doc)
+        remote_upload_json(
+            cfg,
+            remote_json_path,
+            transcript_doc,
+            backend=remote_backend,
+        )
 
         entry["stage"] = "done"
         entry["processed_sig"] = entry.get("last_sig")
         entry["last_finished_at"] = now_iso()
         save_state(cfg.state_path, state)
         try:
-            remote_archive_or_delete(cfg, remote_audio_path)
+            remote_archive_or_delete(
+                cfg,
+                remote_audio_path,
+                backend=remote_backend,
+            )
         except Exception:
             logging.exception(
                 "Could not archive/delete remote audio after success: %s",
@@ -2912,7 +3633,12 @@ def process_remote_audio(
                 "updated_at": now_iso(),
             }
         try:
-            remote_upload_json(cfg, remote_json_path, error_doc)
+            remote_upload_json(
+                cfg,
+                remote_json_path,
+                error_doc,
+                backend=remote_backend,
+            )
         except Exception:
             logging.exception("Could not upload error JSON for %s", remote_audio_path)
 
@@ -2923,10 +3649,13 @@ def should_process_file(
     state: Dict[str, Any],
     cfg: Config,
 ) -> bool:
+    remote_backend = remote_file_backend(remote_file)
     remote_audio_path = remote_file["path"]
     remote_json_path = replace_ext(remote_audio_path, ".json")
-    remote_json_meta = remote_files_by_path.get(remote_json_path)
-    entry = state["files"].setdefault(remote_audio_path, {})
+    remote_json_meta = remote_files_by_path.get(
+        remote_lookup_key(remote_backend, remote_json_path)
+    )
+    entry = state["files"].setdefault(remote_file_lookup_key(remote_file), {})
 
     last_sig = entry.get("last_sig")
     current_sig = f'{remote_file["size"]}:{remote_file.get("modify") or ""}'
@@ -2957,7 +3686,11 @@ def should_process_file(
         if json_modify is None or audio_modify is None or json_modify >= audio_modify:
             saved_remote_doc: Optional[Dict[str, Any]] = None
             try:
-                saved_remote_doc = remote_load_json(cfg, remote_json_path)
+                saved_remote_doc = remote_load_json(
+                    cfg,
+                    remote_json_path,
+                    backend=remote_backend,
+                )
             except Exception:
                 logging.exception(
                     "Could not inspect existing remote JSON while deciding retry/skip: %s",
@@ -2967,6 +3700,7 @@ def should_process_file(
             existing_json_state = classify_saved_remote_json(
                 saved_remote_doc,
                 remote_audio_path,
+                remote_backend=remote_backend,
             )
             if existing_json_state == "completed":
                 entry["stage"] = "done"
@@ -3001,6 +3735,7 @@ def should_process_file(
                         "skipped_too_small",
                         reason,
                     ),
+                    backend=remote_backend,
                 )
             except Exception:
                 logging.exception(
@@ -3029,7 +3764,7 @@ def scan_cycle(cfg: Config, client: OpenAIClients, state: Dict[str, Any]) -> Non
         logging.warning("Remote scan skipped: %s", exc)
         return
 
-    remote_files_by_path = {item["path"]: item for item in all_files}
+    remote_files_by_path = {remote_file_lookup_key(item): item for item in all_files}
     audio_files = [
         item
         for item in all_files
@@ -3055,7 +3790,7 @@ def scan_cycle(cfg: Config, client: OpenAIClients, state: Dict[str, Any]) -> Non
     )
     if not verify_openai_route_before_processing(cfg, client):
         logging.warning(
-            "Skipping cycle before FTP downloads because the OpenAI route is unavailable."
+            "Skipping cycle before remote downloads because the OpenAI route is unavailable."
         )
         return
     if (
@@ -3092,13 +3827,18 @@ def main() -> None:
     cfg.work_root.mkdir(parents=True, exist_ok=True)
     ensure_parent_dir(cfg.state_path)
 
-    if cfg.ftp_protocol not in {"ftp", "sftp"}:
-        raise ValueError("FTP_PROTOCOL must be either 'ftp' or 'sftp'")
-    if cfg.ftp_protocol == "ftp" and cfg.ftp_port == 22:
+    if not cfg.ftp_enabled and not cfg.yandex_disk_enabled:
         raise ValueError(
-            "FTP_PROTOCOL=ftp with FTP_PORT=22 is likely a misconfiguration. "
-            "Use FTP_PROTOCOL=sftp for port 22, or switch FTP_PORT to your FTP/FTPS port."
+            "Configure at least one remote source: FTP_* or YANDEX_DISK_*."
         )
+    if cfg.ftp_enabled:
+        if cfg.ftp_protocol not in {"ftp", "sftp"}:
+            raise ValueError("FTP_PROTOCOL must be either 'ftp' or 'sftp'")
+        if cfg.ftp_protocol == "ftp" and cfg.ftp_port == 22:
+            raise ValueError(
+                "FTP_PROTOCOL=ftp with FTP_PORT=22 is likely a misconfiguration. "
+                "Use FTP_PROTOCOL=sftp for port 22, or switch FTP_PORT to your FTP/FTPS port."
+            )
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is required but was not found in PATH")
     if shutil.which("ffprobe") is None:
@@ -3139,15 +3879,26 @@ def main() -> None:
         )
     if cfg.telegram_proxy:
         logging.info("Using dedicated Telegram proxy from TELEGRAM_PROXY.")
+    if cfg.ftp_enabled:
+        logging.info(
+            "FTP/SFTP source is enabled. Protocol: %s. Remote roots: %s",
+            cfg.ftp_protocol,
+            ", ".join(cfg.ftp_remote_roots),
+        )
+    if cfg.yandex_disk_enabled:
+        logging.info(
+            "Yandex Disk source is enabled. Remote roots: %s",
+            ", ".join(cfg.yandex_disk_remote_roots),
+        )
     try:
         client, openai_http_clients = build_openai_clients(cfg)
         state = load_state(cfg.state_path)
 
         logging.info(
-            "Daemon started. Poll interval: %s sec. Protocol: %s. Remote roots: %s",
+            "Daemon started. Poll interval: %s sec. Sources: ftp=%s, yandex_disk=%s",
             cfg.poll_interval_sec,
-            cfg.ftp_protocol,
-            ", ".join(cfg.ftp_remote_roots),
+            cfg.ftp_enabled,
+            cfg.yandex_disk_enabled,
         )
         while True:
             try:
