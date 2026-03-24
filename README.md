@@ -1,6 +1,6 @@
 # Call Brief AI
 
-`Call Brief AI` — это production-сервис для VPS, который забирает записи разговоров с FTP или SFTP, делает транскрибацию через OpenAI, формирует итоговое сообщение и отправляет его в Telegram.
+`Call Brief AI` — это production-сервис для VPS, который забирает записи разговоров с FTP, SFTP и при необходимости с Яндекс Диска, делает транскрибацию через OpenAI, формирует итоговое сообщение и отправляет его в Telegram.
 
 ## Что делает сервис
 
@@ -9,7 +9,7 @@
 3. Скачивает аудио и нормализует его через `ffmpeg`.
 4. При необходимости режет файл на части по `TARGET_PART_MAX_BYTES`.
 5. Отправляет части в OpenAI на транскрибацию с diarization.
-6. Собирает единый JSON разговора и сохраняет его рядом с аудио на FTP/SFTP.
+6. Собирает единый JSON разговора и сохраняет его рядом с аудио на том же источнике: FTP, SFTP или Яндекс Диск.
 7. Отправляет JSON разговора в OpenAI Responses API и получает готовый текст для Telegram.
 8. Публикует сообщение в Telegram от имени бота.
 9. По настройке оставляет исходный файл, переносит его в архив или удаляет.
@@ -195,6 +195,15 @@ FTP_TIMEOUT_SEC=120
 FTP_CONNECT_ATTEMPTS=2
 FTP_RETRY_DELAY_SEC=5
 
+# Optional: Yandex Disk source. Can work together with FTP/SFTP.
+YANDEX_DISK_OAUTH_TOKEN=
+YANDEX_DISK_REMOTE_ROOT=
+# YANDEX_DISK_REMOTE_ROOTS=disk:/recordings/sales,disk:/recordings/support
+YANDEX_DISK_ARCHIVE_DIR=
+YANDEX_DISK_MOVE_TO_ARCHIVE_AFTER_SUCCESS=0
+YANDEX_DISK_DELETE_AFTER_SUCCESS=0
+YANDEX_DISK_TIMEOUT_SEC=120
+
 INSTRUCTIONS_JSON_PATH=/opt/call_brief_ai/shared/instructions.json
 INSTRUCTION_JSON_PATH=/opt/call_brief_ai/shared/instructions.json
 STATE_PATH=/opt/call_brief_ai/shared/state.json
@@ -222,7 +231,194 @@ LOG_LEVEL=INFO
 
 Для одной папки используйте `FTP_REMOTE_ROOT`. Если нужно несколько корней, задайте `FTP_REMOTE_ROOTS` через запятую, например `FTP_REMOTE_ROOTS=/recordings/sales,/recordings/support`.
 
+Для Яндекс Диска задайте `YANDEX_DISK_OAUTH_TOKEN` и один корень через `YANDEX_DISK_REMOTE_ROOT` или несколько корней через `YANDEX_DISK_REMOTE_ROOTS`. Пути можно указывать как `/recordings`, так и в формате `disk:/recordings`. Источник Яндекс Диска можно включать одновременно с FTP/SFTP.
+
 Если `FTP_ARCHIVE_DIR` задан, все успешно обработанные файлы будут переноситься в этот общий архив. Если `FTP_ARCHIVE_DIR` не задан и включен `FTP_MOVE_TO_ARCHIVE_AFTER_SUCCESS=1`, daemon будет использовать `archive` внутри каждого корня, то есть `/recordings/sales/archive`, `/recordings/support/archive` и так далее.
+
+Для Яндекс Диска действует та же схема: если `YANDEX_DISK_ARCHIVE_DIR` задан, обработанные записи будут переноситься туда; если переменная пустая и включен `YANDEX_DISK_MOVE_TO_ARCHIVE_AFTER_SUCCESS=1`, daemon будет использовать `archive` внутри каждого заданного корня.
+
+## Настройка источников
+
+Сервис умеет работать в трех режимах:
+
+1. Только FTP/FTPS/SFTP
+2. Только Яндекс Диск
+3. Сразу оба источника одновременно
+
+Если используете только FTP/SFTP, оставьте `YANDEX_DISK_*` пустыми.
+
+Если используете только Яндекс Диск, очистите `FTP_HOST`, `FTP_USER`/`FTP_USERNAME` и `FTP_PASSWORD`, а также задайте `YANDEX_DISK_*`.
+
+Если используете оба источника, заполните оба блока. Сервис будет сканировать оба источника в каждом цикле и обрабатывать все найденные аудиозаписи.
+
+## Что Откуда Брать
+
+### Для FTP/SFTP
+
+Нужно заполнить:
+
+- `FTP_PROTOCOL` — какой протокол использует ваш сервер: `ftp` или `sftp`
+- `FTP_HOST` — адрес FTP/SFTP сервера
+- `FTP_PORT` — порт сервера
+- `FTP_USER` или `FTP_USERNAME` — логин
+- `FTP_PASSWORD` — пароль
+- `FTP_REMOTE_ROOT` или `FTP_REMOTE_ROOTS` — папка или список папок, где лежат записи разговоров
+
+Это все берется у администратора FTP/SFTP, на VPS или в настройках той системы, которая выгружает записи.
+
+### Для Яндекс Диска
+
+Нужно заполнить:
+
+- `YANDEX_DISK_OAUTH_TOKEN` — OAuth токен Яндекса
+- `YANDEX_DISK_REMOTE_ROOT` или `YANDEX_DISK_REMOTE_ROOTS` — папка или список папок на Яндекс Диске, куда Mango складывает записи
+- `YANDEX_DISK_ARCHIVE_DIR` — необязательная папка архива
+
+Что откуда брать:
+
+- `YANDEX_DISK_OAUTH_TOKEN` берется в Яндекс OAuth
+- `YANDEX_DISK_REMOTE_ROOT` — это точный путь к папке на Яндекс Диске, куда Mango выгружает записи
+- `YANDEX_DISK_ARCHIVE_DIR` — это папка на Яндекс Диске, куда сервис будет переносить уже обработанные записи, если вы включите архивирование
+
+Пути Яндекс Диска можно писать в двух вариантах:
+
+- `/recordings/mango`
+- `disk:/recordings/mango`
+
+Оба варианта поддерживаются. Внутри сервиса путь будет нормализован.
+
+## Как Настроить Яндекс Диск
+
+### Шаг 1. Подготовьте папку на Яндекс Диске
+
+Создайте папку, куда Mango будет выгружать записи, например:
+
+```text
+disk:/mango/records
+```
+
+Если хотите отдельный архив обработанных файлов, заранее создайте, например:
+
+```text
+disk:/mango/archive
+```
+
+### Шаг 2. Получите OAuth токен Яндекса
+
+Что сделать:
+
+1. Войдите в тот Яндекс-аккаунт, на чьем Диске лежит нужная папка.
+2. Зарегистрируйте приложение в Yandex OAuth.
+3. Получите OAuth token для этого приложения.
+4. Скопируйте токен в `YANDEX_DISK_OAUTH_TOKEN`.
+
+Официальные страницы Яндекса:
+
+- Yandex Disk REST API: `https://yandex.com/dev/disk/rest/`
+- Регистрация приложения: `https://yandex.com/dev/id/doc/en/register-client`
+- Получение OAuth token: `https://yandex.com/dev/id/doc/access`
+
+Важно:
+
+- токен должен принадлежать аккаунту, у которого есть доступ к нужной папке на Яндекс Диске
+- токен храните только в приватном `.env`, не в репозитории
+
+### Шаг 3. Укажите корень, который сканировать
+
+Если Mango выгружает в одну папку:
+
+```dotenv
+YANDEX_DISK_OAUTH_TOKEN=your_token_here
+YANDEX_DISK_REMOTE_ROOT=disk:/mango/records
+```
+
+Если Mango выгружает в несколько папок:
+
+```dotenv
+YANDEX_DISK_OAUTH_TOKEN=your_token_here
+YANDEX_DISK_REMOTE_ROOTS=disk:/mango/sales,disk:/mango/support
+```
+
+### Шаг 4. При необходимости включите архивирование
+
+Если хотите переносить обработанные записи в архив:
+
+```dotenv
+YANDEX_DISK_MOVE_TO_ARCHIVE_AFTER_SUCCESS=1
+YANDEX_DISK_ARCHIVE_DIR=disk:/mango/archive
+```
+
+Если архив не нужен:
+
+```dotenv
+YANDEX_DISK_MOVE_TO_ARCHIVE_AFTER_SUCCESS=0
+YANDEX_DISK_DELETE_AFTER_SUCCESS=0
+```
+
+Если хотите удалять исходные файлы после обработки:
+
+```dotenv
+YANDEX_DISK_DELETE_AFTER_SUCCESS=1
+YANDEX_DISK_MOVE_TO_ARCHIVE_AFTER_SUCCESS=0
+```
+
+Не включайте одновременно и перенос в архив, и удаление без понимания результата.
+
+## Что Указывать Со Стороны Mango
+
+Со стороны Mango нужно настроить выгрузку записей в ту папку, которую вы потом укажете у нас в `YANDEX_DISK_REMOTE_ROOT` или `YANDEX_DISK_REMOTE_ROOTS`.
+
+Пример:
+
+- в Mango выбрали папку выгрузки `disk:/mango/records`
+- в `.env` указали `YANDEX_DISK_REMOTE_ROOT=disk:/mango/records`
+
+То есть в нашем конфиге путь должен совпадать с фактической папкой выгрузки Mango.
+
+Если в Mango записи попадают в разные папки для разных отделов, лучше сразу использовать `YANDEX_DISK_REMOTE_ROOTS`.
+
+## Готовые Примеры
+
+### Только FTP/SFTP
+
+```dotenv
+FTP_PROTOCOL=sftp
+FTP_HOST=sftp.example.com
+FTP_PORT=22
+FTP_USER=myuser
+FTP_PASSWORD=mypassword
+FTP_REMOTE_ROOT=/recordings
+
+YANDEX_DISK_OAUTH_TOKEN=
+YANDEX_DISK_REMOTE_ROOT=
+```
+
+### Только Яндекс Диск
+
+```dotenv
+FTP_HOST=
+FTP_USER=
+FTP_PASSWORD=
+
+YANDEX_DISK_OAUTH_TOKEN=your_token_here
+YANDEX_DISK_REMOTE_ROOT=disk:/mango/records
+YANDEX_DISK_MOVE_TO_ARCHIVE_AFTER_SUCCESS=1
+YANDEX_DISK_ARCHIVE_DIR=disk:/mango/archive
+```
+
+### И FTP, И Яндекс Диск
+
+```dotenv
+FTP_PROTOCOL=sftp
+FTP_HOST=sftp.example.com
+FTP_PORT=22
+FTP_USER=myuser
+FTP_PASSWORD=mypassword
+FTP_REMOTE_ROOT=/recordings
+
+YANDEX_DISK_OAUTH_TOKEN=your_token_here
+YANDEX_DISK_REMOTE_ROOT=disk:/mango/records
+```
 
 Если хотите переносить исходные записи в архив после успеха:
 
