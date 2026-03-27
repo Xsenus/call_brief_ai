@@ -819,6 +819,62 @@ class ArchiveResolutionTests(unittest.TestCase):
 
 
 class RemoteWalkTests(unittest.TestCase):
+    def test_sftp_walk_skips_unreadable_subdirectories(self):
+        cfg = make_config(
+            ftp_remote_root="/",
+            ftp_remote_roots=["/"],
+            ftp_archive_dir="/recordings/archive",
+        )
+        root_entries = [
+            mock.Mock(
+                filename="recordings",
+                st_mode=daemon.stat.S_IFDIR,
+                st_size=0,
+                st_mtime=None,
+            ),
+            mock.Mock(
+                filename="lost+found",
+                st_mode=daemon.stat.S_IFDIR,
+                st_size=0,
+                st_mtime=None,
+            ),
+        ]
+        recordings_entries = [
+            mock.Mock(
+                filename="call.mp3",
+                st_mode=daemon.stat.S_IFREG,
+                st_size=128,
+                st_mtime=1_742_000_000,
+            ),
+            mock.Mock(
+                filename="archive",
+                st_mode=daemon.stat.S_IFDIR,
+                st_size=0,
+                st_mtime=None,
+            ),
+        ]
+
+        sftp = mock.Mock()
+        transport = mock.Mock()
+
+        def listdir_attr(path: str):
+            if path == "/":
+                return root_entries
+            if path == "/recordings":
+                return recordings_entries
+            if path == "/lost+found":
+                raise PermissionError(13, "Permission denied")
+            raise AssertionError(f"Unexpected path: {path}")
+
+        sftp.listdir_attr.side_effect = listdir_attr
+
+        with mock.patch("callbot_daemon.sftp_connect", return_value=(transport, sftp)):
+            files = daemon.sftp_walk(cfg, "/")
+
+        self.assertEqual([item["path"] for item in files], ["/recordings/call.mp3"])
+        sftp.close.assert_called_once()
+        transport.close.assert_called_once()
+
     def test_sftp_remote_walk_scans_all_roots_and_deduplicates(self):
         cfg = make_config(
             ftp_protocol="sftp",

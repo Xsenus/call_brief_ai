@@ -1371,6 +1371,14 @@ def connect_with_retry(cfg: Config, protocol: str, fn):
     ) from last_exc
 
 
+def is_remote_permission_error(exc: Exception) -> bool:
+    if isinstance(exc, PermissionError):
+        return True
+    if getattr(exc, "errno", None) == 13:
+        return True
+    return "permission denied" in str(exc).lower()
+
+
 def ftp_connect_once(cfg: Config, encoding: Optional[str] = None):
     ftp = ReusedSessionFTP_TLS() if cfg.ftp_use_tls else FTP()
     ftp.encoding = encoding or cfg.ftp_encoding
@@ -1471,9 +1479,22 @@ def ensure_sftp_dir(sftp: paramiko.SFTPClient, directory: str) -> None:
 def sftp_walk(cfg: Config, root: str) -> List[Dict[str, Any]]:
     transport, sftp = sftp_connect(cfg)
     result: List[Dict[str, Any]] = []
+    root_path = normalize_remote_path(root)
 
     def walk(path: str) -> None:
-        for entry in sftp.listdir_attr(path):
+        try:
+            entries = sftp.listdir_attr(path)
+        except Exception as exc:
+            if path != root_path and is_remote_permission_error(exc):
+                logging.debug(
+                    "Skipping unreadable SFTP directory during scan: %s (%s)",
+                    path,
+                    exc,
+                )
+                return
+            raise
+
+        for entry in entries:
             name = entry.filename
             if name in (".", ".."):
                 continue
@@ -1500,7 +1521,7 @@ def sftp_walk(cfg: Config, root: str) -> List[Dict[str, Any]]:
             )
 
     try:
-        walk(normalize_remote_path(root))
+        walk(root_path)
         return result
     finally:
         try:
