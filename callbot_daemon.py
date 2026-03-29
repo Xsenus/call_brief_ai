@@ -2894,6 +2894,84 @@ def ensure_audio_blob_persisted(
         sync_audio_blob_to_db(db_store, transcript_doc, local_audio)
 
 
+def build_remote_backfill_sig(
+    remote_file: Dict[str, Any],
+    remote_json_meta: Optional[Dict[str, Any]],
+) -> str:
+    json_size = ""
+    json_modify = ""
+    if isinstance(remote_json_meta, dict):
+        json_size = str(remote_json_meta.get("size") or "")
+        json_modify = str(remote_json_meta.get("modify") or "")
+    return (
+        f'{remote_file.get("size") or ""}:{remote_file.get("modify") or ""}'
+        f'|{json_size}:{json_modify}'
+    )
+
+
+def backfill_remote_result_to_db(
+    cfg: Config,
+    remote_file: Dict[str, Any],
+    remote_json_meta: Optional[Dict[str, Any]],
+    state: Dict[str, Any],
+    db_store: Optional[DatabaseStore],
+) -> bool:
+    if db_store is None or not isinstance(remote_json_meta, dict):
+        return False
+
+    remote_backend = remote_file_backend(remote_file)
+    remote_audio_path = remote_file["path"]
+    remote_json_path = replace_ext(remote_audio_path, ".json")
+    entry = state["files"].setdefault(remote_file_lookup_key(remote_file), {})
+    backfill_sig = build_remote_backfill_sig(remote_file, remote_json_meta)
+    if entry.get("db_backfill_sig") == backfill_sig:
+        return False
+
+    try:
+        transcript_doc = remote_load_json(
+            cfg,
+            remote_json_path,
+            backend=remote_backend,
+        )
+    except Exception:
+        logging.exception(
+            "Could not load remote JSON for PostgreSQL backfill: %s",
+            remote_json_path,
+        )
+        return False
+
+    if not document_matches_remote_audio(
+        transcript_doc,
+        remote_audio_path,
+        remote_backend=remote_backend,
+    ):
+        return False
+
+    try:
+        sync_transcript_doc_to_db(db_store, transcript_doc)
+        ensure_audio_blob_persisted(
+            cfg,
+            remote_file,
+            transcript_doc,
+            db_store,
+            backend=remote_backend,
+        )
+    except Exception:
+        logging.exception(
+            "Could not backfill remote result to PostgreSQL: %s",
+            remote_audio_path,
+        )
+        return False
+
+    entry["db_backfill_sig"] = backfill_sig
+    entry["db_backfilled_at"] = now_iso()
+    logging.info(
+        "Backfilled existing remote result to PostgreSQL: %s",
+        remote_audio_path,
+    )
+    return True
+
+
 def remote_load_json(
     cfg: Config,
     remote_path: str,
@@ -4585,6 +4663,28 @@ def scan_cycle(
     audio_files.sort(key=lambda item: item["path"])
 
     logging.info("Cycle started. Found %s audio file(s).", len(audio_files))
+    backfilled_count = 0
+    for remote_file in audio_files:
+        remote_backend = remote_file_backend(remote_file)
+        remote_json_path = replace_ext(remote_file["path"], ".json")
+        remote_json_meta = remote_files_by_path.get(
+            remote_lookup_key(remote_backend, remote_json_path)
+        )
+        if backfill_remote_result_to_db(
+            cfg,
+            remote_file,
+            remote_json_meta,
+            state,
+            db_store,
+        ):
+            backfilled_count += 1
+
+    if backfilled_count:
+        logging.info(
+            "Backfilled %s existing remote result(s) to PostgreSQL.",
+            backfilled_count,
+        )
+
     processable_files = [
         remote_file
         for remote_file in audio_files

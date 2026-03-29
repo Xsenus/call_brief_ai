@@ -1367,6 +1367,69 @@ class ScanCycleTests(unittest.TestCase):
             mocked_probe.assert_not_called()
             mocked_process.assert_not_called()
 
+    def test_scan_cycle_backfills_existing_remote_json_to_db(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cfg = make_config(
+                state_path=Path(temp_dir) / "state.json",
+                work_root=Path(temp_dir),
+            )
+            state = {"files": {}}
+            clients = daemon.OpenAIClients(
+                primary=mock.Mock(),
+                direct_fallback=None,
+                proxy_enabled=False,
+                proxy_failure_cooldown_sec=60,
+            )
+            remote_audio = {
+                "path": "/recordings/call.mp3",
+                "name": "call.mp3",
+                "size": 123456,
+                "modify": "20260323070000",
+            }
+            remote_json = {
+                "path": "/recordings/call.json",
+                "name": "call.json",
+                "size": 2048,
+                "modify": "20260323080000",
+            }
+            saved_doc = {
+                "generated_at": "2026-03-23T00:00:00+00:00",
+                "stage": "done",
+                "status": "ok",
+                "source": {
+                    "storage_backend": daemon.REMOTE_BACKEND_FTP,
+                    "source_path_audio": "/recordings/call.mp3",
+                    "ftp_path_audio": "/recordings/call.mp3",
+                    "file_name_audio": "call.mp3",
+                },
+                "transcription": {
+                    "dialogue_text": "Person 1: test",
+                    "full_text": "test",
+                    "word_count": 1,
+                    "duration_min_total": 1.0,
+                    "parts": [],
+                },
+                "analysis": {"telegram_message": "Ready"},
+                "telegram": {"sent": True, "updated_at": "2026-03-23T00:10:00+00:00"},
+            }
+
+            with (
+                mock.patch("callbot_daemon.load_instruction_text", return_value="Instruction"),
+                mock.patch("callbot_daemon.remote_walk", return_value=[remote_audio, remote_json]),
+                mock.patch("callbot_daemon.remote_load_json", return_value=saved_doc),
+                mock.patch("callbot_daemon.sync_transcript_doc_to_db") as mocked_sync,
+                mock.patch("callbot_daemon.ensure_audio_blob_persisted") as mocked_audio,
+                mock.patch("callbot_daemon.verify_openai_route_before_processing") as mocked_probe,
+                mock.patch("callbot_daemon.process_remote_audio") as mocked_process,
+            ):
+                daemon.scan_cycle(cfg, clients, state, db_store=mock.Mock())
+
+            mocked_sync.assert_called_once()
+            mocked_audio.assert_called_once()
+            mocked_probe.assert_not_called()
+            mocked_process.assert_not_called()
+            self.assertIn("db_backfill_sig", state["files"]["/recordings/call.mp3"])
+
 
 class TranscriptionRequestTests(unittest.TestCase):
     def test_transcribe_part_uses_requests_endpoint_with_proxy(self):
