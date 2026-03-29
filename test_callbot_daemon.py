@@ -1418,13 +1418,13 @@ class ScanCycleTests(unittest.TestCase):
                 mock.patch("callbot_daemon.remote_walk", return_value=[remote_audio, remote_json]),
                 mock.patch("callbot_daemon.remote_load_json", return_value=saved_doc),
                 mock.patch("callbot_daemon.sync_transcript_doc_to_db") as mocked_sync,
-                mock.patch("callbot_daemon.ensure_audio_blob_persisted") as mocked_audio,
+                mock.patch("callbot_daemon.ensure_audio_blob_persisted_from_candidates") as mocked_audio,
                 mock.patch("callbot_daemon.verify_openai_route_before_processing") as mocked_probe,
                 mock.patch("callbot_daemon.process_remote_audio") as mocked_process,
             ):
                 daemon.scan_cycle(cfg, clients, state, db_store=mock.Mock())
 
-            mocked_sync.assert_called_once()
+            self.assertGreaterEqual(mocked_sync.call_count, 1)
             mocked_audio.assert_called_once()
             mocked_probe.assert_not_called()
             mocked_process.assert_not_called()

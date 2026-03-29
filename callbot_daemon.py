@@ -2878,88 +2878,203 @@ def ensure_audio_blob_persisted(
         db_info["audio_blob_id"] = existing_audio_blob_id
         return
 
-    with tempfile.TemporaryDirectory(dir=cfg.work_root) as tmp_dir_name:
-        tmp_dir = Path(tmp_dir_name)
-        local_audio = tmp_dir / remote_file["name"]
-        logging.info(
-            "Downloading audio for PostgreSQL blob sync: %s",
-            remote_file["path"],
-        )
-        remote_download_file(
-            cfg,
-            remote_file["path"],
-            local_audio,
-            backend=backend,
-        )
-        sync_audio_blob_to_db(db_store, transcript_doc, local_audio)
-
-
-def build_remote_backfill_sig(
-    remote_file: Dict[str, Any],
-    remote_json_meta: Optional[Dict[str, Any]],
-) -> str:
-    json_size = ""
-    json_modify = ""
-    if isinstance(remote_json_meta, dict):
-        json_size = str(remote_json_meta.get("size") or "")
-        json_modify = str(remote_json_meta.get("modify") or "")
-    return (
-        f'{remote_file.get("size") or ""}:{remote_file.get("modify") or ""}'
-        f'|{json_size}:{json_modify}'
+    ensure_audio_blob_persisted_from_candidates(
+        cfg,
+        transcript_doc,
+        db_store,
+        [str(remote_file["path"])],
+        backend=backend,
     )
 
 
-def backfill_remote_result_to_db(
+def is_remote_not_found_error(exc: Exception) -> bool:
+    if isinstance(exc, FileNotFoundError):
+        return True
+    text = str(exc).strip().lower()
+    if text.startswith("550"):
+        return True
+    return any(
+        marker in text
+        for marker in (
+            "no such file",
+            "not found",
+            "does not exist",
+            "cannot find",
+        )
+    )
+
+
+def ensure_audio_blob_persisted_from_candidates(
     cfg: Config,
-    remote_file: Dict[str, Any],
-    remote_json_meta: Optional[Dict[str, Any]],
+    transcript_doc: Optional[Dict[str, Any]],
+    db_store: Optional[DatabaseStore],
+    remote_audio_candidates: List[str],
+    backend: str = REMOTE_BACKEND_FTP,
+) -> None:
+    if db_store is None or not isinstance(transcript_doc, dict):
+        return
+
+    db_info = ensure_db_storage_metadata(transcript_doc)
+    transcription_id = safe_int(db_info.get("transcription_id"))
+    audio_blob_id = safe_int(db_info.get("audio_blob_id"))
+    if transcription_id is not None and audio_blob_id is not None:
+        return
+
+    if transcription_id is None:
+        sync_transcript_doc_to_db(db_store, transcript_doc)
+        transcription_id = safe_int(db_info.get("transcription_id"))
+        audio_blob_id = safe_int(db_info.get("audio_blob_id"))
+        if transcription_id is None:
+            return
+        if audio_blob_id is not None:
+            return
+
+    existing_audio_blob_id = db_store.get_audio_blob_id(transcription_id)
+    if existing_audio_blob_id is not None:
+        db_info["audio_blob_id"] = existing_audio_blob_id
+        return
+
+    source = transcript_doc.get("source")
+    if not isinstance(source, dict):
+        source = {}
+    filename = str(source.get("file_name_audio") or "").strip() or "audio.bin"
+    tried: List[str] = []
+    with tempfile.TemporaryDirectory(dir=cfg.work_root) as tmp_dir_name:
+        tmp_dir = Path(tmp_dir_name)
+        local_audio = tmp_dir / filename
+        for remote_audio_path in remote_audio_candidates:
+            candidate = normalize_source_path(backend, remote_audio_path)
+            if candidate in tried:
+                continue
+            tried.append(candidate)
+            logging.info(
+                "Downloading audio for PostgreSQL blob sync: %s",
+                candidate,
+            )
+            try:
+                remote_download_file(
+                    cfg,
+                    candidate,
+                    local_audio,
+                    backend=backend,
+                )
+            except Exception as exc:
+                if is_remote_not_found_error(exc):
+                    continue
+                raise
+            sync_audio_blob_to_db(db_store, transcript_doc, local_audio)
+            return
+
+    logging.warning(
+        "Could not find remote audio for PostgreSQL blob sync. Tried: %s",
+        ", ".join(tried) or "<none>",
+    )
+
+
+def build_remote_json_backfill_sig(
+    remote_json_meta: Dict[str, Any],
+    source_audio_path: str,
+) -> str:
+    return (
+        f"{source_audio_path}|"
+        f'{remote_json_meta.get("size") or ""}:{remote_json_meta.get("modify") or ""}'
+    )
+
+
+def audio_blob_candidate_paths_for_transcript(
+    cfg: Config,
+    transcript_doc: Dict[str, Any],
+    backend: str = REMOTE_BACKEND_FTP,
+) -> List[str]:
+    source = transcript_doc.get("source")
+    if not isinstance(source, dict):
+        return []
+    source_audio_path = str(
+        source.get("source_path_audio") or source.get("ftp_path_audio") or ""
+    ).strip()
+    if not source_audio_path:
+        return []
+    normalized_backend = normalize_storage_backend(backend)
+    normalized_source_path = normalize_source_path(
+        normalized_backend,
+        source_audio_path,
+    )
+    archive_dir = resolve_archive_dir_for_path(
+        cfg,
+        normalized_source_path,
+        backend=normalized_backend,
+    )
+    archived_path = join_source_path(
+        normalized_backend,
+        archive_dir,
+        posixpath.basename(normalized_source_path),
+    )
+    if archived_path == normalized_source_path:
+        return [normalized_source_path]
+    return [normalized_source_path, archived_path]
+
+
+def backfill_remote_json_result_to_db(
+    cfg: Config,
+    remote_json_meta: Dict[str, Any],
     state: Dict[str, Any],
     db_store: Optional[DatabaseStore],
 ) -> bool:
     if db_store is None or not isinstance(remote_json_meta, dict):
         return False
 
-    remote_backend = remote_file_backend(remote_file)
-    remote_audio_path = remote_file["path"]
-    remote_json_path = replace_ext(remote_audio_path, ".json")
-    entry = state["files"].setdefault(remote_file_lookup_key(remote_file), {})
-    backfill_sig = build_remote_backfill_sig(remote_file, remote_json_meta)
-    if entry.get("db_backfill_sig") == backfill_sig:
+    remote_backend = remote_file_backend(remote_json_meta)
+    remote_json_path = remote_json_meta["path"]
+    transcript_doc = remote_load_json(
+        cfg,
+        remote_json_path,
+        backend=remote_backend,
+    )
+    if not isinstance(transcript_doc, dict):
         return False
 
-    try:
-        transcript_doc = remote_load_json(
-            cfg,
-            remote_json_path,
-            backend=remote_backend,
-        )
-    except Exception:
-        logging.exception(
-            "Could not load remote JSON for PostgreSQL backfill: %s",
-            remote_json_path,
-        )
+    source = transcript_doc.get("source")
+    if not isinstance(source, dict):
+        return False
+    source_audio_path = str(
+        source.get("source_path_audio") or source.get("ftp_path_audio") or ""
+    ).strip()
+    if not source_audio_path:
+        return False
+    source_audio_path = normalize_source_path(remote_backend, source_audio_path)
+
+    entry = state["files"].setdefault(
+        remote_lookup_key(remote_backend, source_audio_path),
+        {},
+    )
+    backfill_sig = build_remote_json_backfill_sig(remote_json_meta, source_audio_path)
+    if entry.get("db_backfill_sig") == backfill_sig:
         return False
 
     if not document_matches_remote_audio(
         transcript_doc,
-        remote_audio_path,
+        source_audio_path,
         remote_backend=remote_backend,
     ):
         return False
 
     try:
         sync_transcript_doc_to_db(db_store, transcript_doc)
-        ensure_audio_blob_persisted(
+        ensure_audio_blob_persisted_from_candidates(
             cfg,
-            remote_file,
             transcript_doc,
             db_store,
+            audio_blob_candidate_paths_for_transcript(
+                cfg,
+                transcript_doc,
+                backend=remote_backend,
+            ),
             backend=remote_backend,
         )
     except Exception:
         logging.exception(
             "Could not backfill remote result to PostgreSQL: %s",
-            remote_audio_path,
+            source_audio_path,
         )
         return False
 
@@ -2967,7 +3082,7 @@ def backfill_remote_result_to_db(
     entry["db_backfilled_at"] = now_iso()
     logging.info(
         "Backfilled existing remote result to PostgreSQL: %s",
-        remote_audio_path,
+        source_audio_path,
     )
     return True
 
@@ -4660,19 +4775,19 @@ def scan_cycle(
         for item in all_files
         if posixpath.splitext(item["name"])[1].lower() in AUDIO_EXTENSIONS
     ]
+    json_files = [
+        item
+        for item in all_files
+        if posixpath.splitext(item["name"])[1].lower() == ".json"
+    ]
     audio_files.sort(key=lambda item: item["path"])
+    json_files.sort(key=lambda item: item["path"])
 
     logging.info("Cycle started. Found %s audio file(s).", len(audio_files))
     backfilled_count = 0
-    for remote_file in audio_files:
-        remote_backend = remote_file_backend(remote_file)
-        remote_json_path = replace_ext(remote_file["path"], ".json")
-        remote_json_meta = remote_files_by_path.get(
-            remote_lookup_key(remote_backend, remote_json_path)
-        )
-        if backfill_remote_result_to_db(
+    for remote_json_meta in json_files:
+        if backfill_remote_json_result_to_db(
             cfg,
-            remote_file,
             remote_json_meta,
             state,
             db_store,
