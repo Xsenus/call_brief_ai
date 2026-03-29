@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import io
+import hashlib
 import json
 import logging
+import mimetypes
 import os
 import posixpath
 import re
@@ -17,9 +19,11 @@ from datetime import datetime, timezone
 from ftplib import FTP, FTP_TLS, all_errors, error_perm
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 import paramiko
+import psycopg
 import requests
 from dotenv import load_dotenv
 from openai import (
@@ -29,6 +33,8 @@ from openai import (
     OpenAI,
     PermissionDeniedError,
 )
+from psycopg import sql
+from psycopg.rows import dict_row
 
 
 load_dotenv()
@@ -62,6 +68,9 @@ DEFAULT_OPENAI_PROXY_FAILURE_COOLDOWN_SEC = 300.0
 DEFAULT_ANALYSIS_REASONING_EFFORT = "low"
 MIN_ANALYSIS_RETRY_MAX_OUTPUT_TOKENS = 2500
 MAX_ANALYSIS_RETRY_MAX_OUTPUT_TOKENS = 6000
+DB_TRANSCRIPTION_TABLE = "ai_cell_trans"
+DB_ANALYSIS_TABLE = "ai_cell_analisys"
+DB_AUDIO_BLOB_TABLE = "ai_cell_audio_blob"
 T = TypeVar("T")
 
 
@@ -610,6 +619,55 @@ def safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
         return default
 
 
+def safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_postgres_url(raw: str) -> str:
+    normalized = (raw or "").strip()
+    if not normalized:
+        return ""
+    if normalized.startswith("postgresql+asyncpg://"):
+        return "postgresql://" + normalized[len("postgresql+asyncpg://"):]
+    if normalized.startswith("postgres+asyncpg://"):
+        return "postgresql://" + normalized[len("postgres+asyncpg://"):]
+    return normalized
+
+
+def parse_postgres_url(raw: str) -> Dict[str, Any]:
+    normalized = normalize_postgres_url(raw)
+    if not normalized:
+        return {}
+
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"postgresql", "postgres"}:
+        raise ValueError(
+            "POSTGRES_DATABASE_URL must start with postgresql://, postgres://, "
+            "postgresql+asyncpg:// or postgres+asyncpg://"
+        )
+
+    query = parse_qs(parsed.query or "", keep_blank_values=True)
+    return {
+        "host": parsed.hostname or "",
+        "port": parsed.port or 5432,
+        "dbname": unquote((parsed.path or "").lstrip("/")),
+        "user": unquote(parsed.username or ""),
+        "password": unquote(parsed.password or ""),
+        "sslmode": str((query.get("sslmode") or [""])[0] or "").strip(),
+        "connect_timeout": safe_int((query.get("connect_timeout") or [""])[0], None),
+    }
+
+
+def guess_audio_mime_type(filename: str) -> str:
+    guessed, _ = mimetypes.guess_type(filename or "")
+    return guessed or "application/octet-stream"
+
+
 @dataclass
 class Config:
     ftp_enabled: bool
@@ -661,6 +719,15 @@ class Config:
     instruction_json_path: Path
     state_path: Path
     work_root: Path
+    db_enabled: bool
+    db_host: str
+    db_port: int
+    db_name: str
+    db_admin_db: str
+    db_user: str
+    db_password: str
+    db_sslmode: str
+    db_connect_timeout_sec: int
     telegram_bot_token: str
     telegram_chat_id: str
     telegram_message_thread_id: Optional[int]
@@ -777,6 +844,36 @@ class Config:
         analysis_reasoning_effort_raw = os.getenv(
             "OPENAI_ANALYSIS_REASONING_EFFORT", ""
         ).strip()
+        db_url = (
+            os.getenv("POSTGRES_DATABASE_URL")
+            or os.getenv("DATABASE_URL")
+            or ""
+        ).strip()
+        db_url_parts = parse_postgres_url(db_url) if db_url else {}
+        db_host = (os.getenv("DB_HOST") or db_url_parts.get("host") or "").strip()
+        db_name = (os.getenv("DB_NAME") or db_url_parts.get("dbname") or "").strip()
+        db_user = (os.getenv("DB_USER") or db_url_parts.get("user") or "").strip()
+        db_password = (
+            os.getenv("DB_PASSWORD")
+            if os.getenv("DB_PASSWORD") is not None
+            else str(db_url_parts.get("password") or "")
+        )
+        db_requested = env_bool("DB_ENABLED", False) or bool(
+            db_url
+            or db_host
+            or db_name
+            or db_user
+            or db_password
+            or (os.getenv("DB_PORT") or "").strip()
+            or (os.getenv("DB_SSLMODE") or "").strip()
+            or (os.getenv("DB_ADMIN_DB") or "").strip()
+        )
+        if db_requested and not (db_host and db_name and db_user):
+            raise ValueError(
+                "PostgreSQL storage is partially configured. Set POSTGRES_DATABASE_URL "
+                "or DB_HOST, DB_NAME, DB_USER and optionally DB_PASSWORD/DB_PORT/DB_SSLMODE, "
+                "or disable DB_ENABLED."
+            )
         ftp_port_default = "22" if ftp_protocol == "sftp" else "21"
         return cls(
             ftp_enabled=ftp_enabled,
@@ -930,6 +1027,31 @@ class Config:
             work_root=Path(os.getenv("WORK_ROOT", "./work"))
             .expanduser()
             .resolve(),
+            db_enabled=db_requested,
+            db_host=db_host,
+            db_port=max(
+                1,
+                int(os.getenv("DB_PORT", str(db_url_parts.get("port") or 5432))),
+            ),
+            db_name=db_name,
+            db_admin_db=(os.getenv("DB_ADMIN_DB", "postgres").strip() or "postgres"),
+            db_user=db_user,
+            db_password=db_password,
+            db_sslmode=(
+                os.getenv("DB_SSLMODE")
+                or str(db_url_parts.get("sslmode") or "")
+                or "prefer"
+            ).strip()
+            or "prefer",
+            db_connect_timeout_sec=max(
+                1,
+                int(
+                    os.getenv(
+                        "DB_CONNECT_TIMEOUT_SEC",
+                        str(db_url_parts.get("connect_timeout") or 10),
+                    )
+                ),
+            ),
             telegram_bot_token=os.environ["TELEGRAM_BOT_TOKEN"],
             telegram_chat_id=os.environ["TELEGRAM_CHAT_ID"],
             telegram_message_thread_id=env_optional_int("TELEGRAM_MESSAGE_THREAD_ID"),
@@ -964,6 +1086,579 @@ class OpenAIClients:
     proxy_enabled: bool
     proxy_failure_cooldown_sec: float
     proxy_unavailable_until: float = 0.0
+
+
+def build_postgres_connect_kwargs(
+    cfg: Config,
+    database: Optional[str] = None,
+    autocommit: bool = False,
+) -> Dict[str, Any]:
+    connect_kwargs: Dict[str, Any] = {
+        "host": cfg.db_host,
+        "port": cfg.db_port,
+        "dbname": database or cfg.db_name,
+        "user": cfg.db_user,
+        "connect_timeout": cfg.db_connect_timeout_sec,
+        "autocommit": autocommit,
+        "row_factory": dict_row,
+    }
+    if cfg.db_password:
+        connect_kwargs["password"] = cfg.db_password
+    if cfg.db_sslmode:
+        connect_kwargs["sslmode"] = cfg.db_sslmode
+    return connect_kwargs
+
+
+def ensure_postgres_database(cfg: Config) -> bool:
+    if not cfg.db_enabled:
+        return False
+
+    try:
+        with psycopg.connect(
+            **build_postgres_connect_kwargs(
+                cfg,
+                database=cfg.db_admin_db,
+                autocommit=True,
+            )
+        ) as admin_conn:
+            with admin_conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM pg_database WHERE datname = %s",
+                    (cfg.db_name,),
+                )
+                if cur.fetchone() is not None:
+                    return False
+                cur.execute(
+                    sql.SQL("CREATE DATABASE {}").format(
+                        sql.Identifier(cfg.db_name)
+                    )
+                )
+                return True
+    except psycopg.Error as exc:
+        raise RuntimeError(
+            "Could not ensure PostgreSQL database "
+            f"'{cfg.db_name}' on {cfg.db_host}:{cfg.db_port}: {exc}"
+        ) from exc
+
+
+@dataclass
+class DatabaseStore:
+    cfg: Config
+
+    @classmethod
+    def from_config(cls, cfg: Config) -> "DatabaseStore":
+        created = ensure_postgres_database(cfg)
+        if created:
+            logging.info(
+                "Created PostgreSQL database '%s' on %s:%s.",
+                cfg.db_name,
+                cfg.db_host,
+                cfg.db_port,
+            )
+        store = cls(cfg=cfg)
+        store.initialize()
+        return store
+
+    def close(self) -> None:
+        return None
+
+    def _connect(self, autocommit: bool = False):
+        return psycopg.connect(
+            **build_postgres_connect_kwargs(
+                self.cfg,
+                autocommit=autocommit,
+            )
+        )
+
+    def initialize(self) -> None:
+        with self._connect() as connection:
+            with connection.cursor() as cur:
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {DB_TRANSCRIPTION_TABLE} (
+                        id BIGSERIAL PRIMARY KEY,
+                        created_datetime TIMESTAMPTZ NOT NULL,
+                        updated_datetime TIMESTAMPTZ NOT NULL,
+                        filename_mp3 TEXT NOT NULL,
+                        source_path_audio TEXT,
+                        storage_backend TEXT,
+                        status TEXT,
+                        transcription_json JSONB NOT NULL,
+                        CONSTRAINT uq_{DB_TRANSCRIPTION_TABLE}_source
+                            UNIQUE (storage_backend, source_path_audio)
+                    )
+                    """
+                )
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {DB_ANALYSIS_TABLE} (
+                        id BIGSERIAL PRIMARY KEY,
+                        created_datetime TIMESTAMPTZ NOT NULL,
+                        updated_datetime TIMESTAMPTZ NOT NULL,
+                        id_cell_trans BIGINT NOT NULL UNIQUE,
+                        text_bot TEXT,
+                        delivered_telegram BOOLEAN NOT NULL DEFAULT FALSE,
+                        delivered_datetime TIMESTAMPTZ,
+                        analysis_json JSONB,
+                        CONSTRAINT fk_{DB_ANALYSIS_TABLE}_cell_trans
+                            FOREIGN KEY (id_cell_trans)
+                            REFERENCES {DB_TRANSCRIPTION_TABLE}(id)
+                            ON DELETE CASCADE
+                    )
+                    """
+                )
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {DB_AUDIO_BLOB_TABLE} (
+                        id BIGSERIAL PRIMARY KEY,
+                        created_datetime TIMESTAMPTZ NOT NULL,
+                        updated_datetime TIMESTAMPTZ NOT NULL,
+                        id_cell_trans BIGINT NOT NULL UNIQUE,
+                        filename_mp3 TEXT NOT NULL,
+                        mime_type TEXT,
+                        size_bytes BIGINT NOT NULL,
+                        sha256_hex TEXT,
+                        audio_blob BYTEA NOT NULL,
+                        CONSTRAINT fk_{DB_AUDIO_BLOB_TABLE}_cell_trans
+                            FOREIGN KEY (id_cell_trans)
+                            REFERENCES {DB_TRANSCRIPTION_TABLE}(id)
+                            ON DELETE CASCADE
+                    )
+                    """
+                )
+                cur.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_{DB_TRANSCRIPTION_TABLE}_filename_mp3
+                    ON {DB_TRANSCRIPTION_TABLE}(filename_mp3)
+                    """
+                )
+                cur.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_{DB_AUDIO_BLOB_TABLE}_filename_mp3
+                    ON {DB_AUDIO_BLOB_TABLE}(filename_mp3)
+                    """
+                )
+
+    def _save_transcription(
+        self,
+        cur: Any,
+        transcript_doc: Dict[str, Any],
+        record_id: Optional[int] = None,
+    ) -> int:
+        source = transcript_doc.get("source")
+        if not isinstance(source, dict):
+            source = {}
+        created_datetime = (
+            str(transcript_doc.get("generated_at") or "").strip() or now_iso()
+        )
+        updated_datetime = now_iso()
+        filename_mp3 = str(source.get("file_name_audio") or "").strip() or "unknown.mp3"
+        source_path_audio = str(
+            source.get("source_path_audio") or source.get("ftp_path_audio") or ""
+        ).strip()
+        storage_backend = str(source.get("storage_backend") or "").strip()
+        status = str(
+            transcript_doc.get("status") or transcript_doc.get("stage") or ""
+        ).strip()
+        transcription_json = json.dumps(transcript_doc, ensure_ascii=False)
+
+        if record_id:
+            cur.execute(
+                f"""
+                UPDATE {DB_TRANSCRIPTION_TABLE}
+                SET updated_datetime = %s,
+                    filename_mp3 = %s,
+                    source_path_audio = %s,
+                    storage_backend = %s,
+                    status = %s,
+                    transcription_json = %s::jsonb
+                WHERE id = %s
+                RETURNING id
+                """,
+                (
+                    updated_datetime,
+                    filename_mp3,
+                    source_path_audio or None,
+                    storage_backend or None,
+                    status or None,
+                    transcription_json,
+                    record_id,
+                ),
+            )
+            row = cur.fetchone()
+            if row is not None:
+                return int(row["id"])
+
+        if source_path_audio and storage_backend:
+            cur.execute(
+                f"""
+                INSERT INTO {DB_TRANSCRIPTION_TABLE} (
+                    created_datetime,
+                    updated_datetime,
+                    filename_mp3,
+                    source_path_audio,
+                    storage_backend,
+                    status,
+                    transcription_json
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                ON CONFLICT (storage_backend, source_path_audio)
+                DO UPDATE SET
+                    updated_datetime = EXCLUDED.updated_datetime,
+                    filename_mp3 = EXCLUDED.filename_mp3,
+                    status = EXCLUDED.status,
+                    transcription_json = EXCLUDED.transcription_json
+                RETURNING id
+                """,
+                (
+                    created_datetime,
+                    updated_datetime,
+                    filename_mp3,
+                    source_path_audio,
+                    storage_backend,
+                    status or None,
+                    transcription_json,
+                ),
+            )
+            return int(cur.fetchone()["id"])
+
+        cur.execute(
+            f"""
+            INSERT INTO {DB_TRANSCRIPTION_TABLE} (
+                created_datetime,
+                updated_datetime,
+                filename_mp3,
+                source_path_audio,
+                storage_backend,
+                status,
+                transcription_json
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+            RETURNING id
+            """,
+            (
+                created_datetime,
+                updated_datetime,
+                filename_mp3,
+                source_path_audio or None,
+                storage_backend or None,
+                status or None,
+                transcription_json,
+            ),
+        )
+        return int(cur.fetchone()["id"])
+
+    def save_transcription(
+        self,
+        transcript_doc: Dict[str, Any],
+        record_id: Optional[int] = None,
+    ) -> int:
+        with self._connect() as connection:
+            with connection.cursor() as cur:
+                return self._save_transcription(cur, transcript_doc, record_id)
+
+    def _save_analysis(
+        self,
+        cur: Any,
+        transcription_id: int,
+        transcript_doc: Dict[str, Any],
+        record_id: Optional[int] = None,
+    ) -> int:
+        analysis = transcript_doc.get("analysis")
+        if not isinstance(analysis, dict):
+            raise ValueError("analysis payload is missing or invalid")
+        telegram = transcript_doc.get("telegram")
+        if not isinstance(telegram, dict):
+            telegram = {}
+
+        created_datetime = str(analysis.get("generated_at") or "").strip() or now_iso()
+        updated_datetime = now_iso()
+        text_bot_raw = analysis.get("telegram_message")
+        text_bot = (
+            str(text_bot_raw).strip()
+            if text_bot_raw is not None and str(text_bot_raw).strip()
+            else None
+        )
+        delivered_telegram = telegram.get("sent") is True
+        delivered_datetime = (
+            str(telegram.get("updated_at") or "").strip() or updated_datetime
+            if delivered_telegram
+            else None
+        )
+        analysis_json = json.dumps(
+            {
+                "analysis": analysis,
+                "telegram": telegram,
+            },
+            ensure_ascii=False,
+        )
+
+        if record_id:
+            cur.execute(
+                f"""
+                UPDATE {DB_ANALYSIS_TABLE}
+                SET updated_datetime = %s,
+                    id_cell_trans = %s,
+                    text_bot = %s,
+                    delivered_telegram = %s,
+                    delivered_datetime = %s,
+                    analysis_json = %s::jsonb
+                WHERE id = %s
+                RETURNING id
+                """,
+                (
+                    updated_datetime,
+                    transcription_id,
+                    text_bot,
+                    delivered_telegram,
+                    delivered_datetime,
+                    analysis_json,
+                    record_id,
+                ),
+            )
+            row = cur.fetchone()
+            if row is not None:
+                return int(row["id"])
+
+        cur.execute(
+            f"""
+            INSERT INTO {DB_ANALYSIS_TABLE} (
+                created_datetime,
+                updated_datetime,
+                id_cell_trans,
+                text_bot,
+                delivered_telegram,
+                delivered_datetime,
+                analysis_json
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (id_cell_trans)
+            DO UPDATE SET
+                updated_datetime = EXCLUDED.updated_datetime,
+                text_bot = EXCLUDED.text_bot,
+                delivered_telegram = EXCLUDED.delivered_telegram,
+                delivered_datetime = EXCLUDED.delivered_datetime,
+                analysis_json = EXCLUDED.analysis_json
+            RETURNING id
+            """,
+            (
+                created_datetime,
+                updated_datetime,
+                transcription_id,
+                text_bot,
+                delivered_telegram,
+                delivered_datetime,
+                analysis_json,
+            ),
+        )
+        return int(cur.fetchone()["id"])
+
+    def save_analysis(
+        self,
+        transcription_id: int,
+        transcript_doc: Dict[str, Any],
+        record_id: Optional[int] = None,
+    ) -> int:
+        with self._connect() as connection:
+            with connection.cursor() as cur:
+                return self._save_analysis(
+                    cur,
+                    transcription_id,
+                    transcript_doc,
+                    record_id,
+                )
+
+    def _save_audio_blob(
+        self,
+        cur: Any,
+        transcription_id: int,
+        audio_path: Path,
+        record_id: Optional[int] = None,
+        filename_override: str = "",
+    ) -> int:
+        audio_bytes = audio_path.read_bytes()
+        filename_mp3 = filename_override.strip() or audio_path.name
+        mime_type = guess_audio_mime_type(filename_mp3)
+        size_bytes = len(audio_bytes)
+        sha256_hex = hashlib.sha256(audio_bytes).hexdigest()
+        created_datetime = now_iso()
+        updated_datetime = created_datetime
+
+        if record_id:
+            cur.execute(
+                f"""
+                UPDATE {DB_AUDIO_BLOB_TABLE}
+                SET updated_datetime = %s,
+                    id_cell_trans = %s,
+                    filename_mp3 = %s,
+                    mime_type = %s,
+                    size_bytes = %s,
+                    sha256_hex = %s,
+                    audio_blob = %s
+                WHERE id = %s
+                RETURNING id
+                """,
+                (
+                    updated_datetime,
+                    transcription_id,
+                    filename_mp3,
+                    mime_type,
+                    size_bytes,
+                    sha256_hex,
+                    audio_bytes,
+                    record_id,
+                ),
+            )
+            row = cur.fetchone()
+            if row is not None:
+                return int(row["id"])
+
+        cur.execute(
+            f"""
+            INSERT INTO {DB_AUDIO_BLOB_TABLE} (
+                created_datetime,
+                updated_datetime,
+                id_cell_trans,
+                filename_mp3,
+                mime_type,
+                size_bytes,
+                sha256_hex,
+                audio_blob
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id_cell_trans)
+            DO UPDATE SET
+                updated_datetime = EXCLUDED.updated_datetime,
+                filename_mp3 = EXCLUDED.filename_mp3,
+                mime_type = EXCLUDED.mime_type,
+                size_bytes = EXCLUDED.size_bytes,
+                sha256_hex = EXCLUDED.sha256_hex,
+                audio_blob = EXCLUDED.audio_blob
+            RETURNING id
+            """,
+            (
+                created_datetime,
+                updated_datetime,
+                transcription_id,
+                filename_mp3,
+                mime_type,
+                size_bytes,
+                sha256_hex,
+                audio_bytes,
+            ),
+        )
+        return int(cur.fetchone()["id"])
+
+    def save_audio_blob(
+        self,
+        transcription_id: int,
+        audio_path: Path,
+        record_id: Optional[int] = None,
+        filename_override: str = "",
+    ) -> int:
+        with self._connect() as connection:
+            with connection.cursor() as cur:
+                return self._save_audio_blob(
+                    cur,
+                    transcription_id,
+                    audio_path,
+                    record_id,
+                    filename_override,
+                )
+
+    def get_audio_blob_id(self, transcription_id: int) -> Optional[int]:
+        with self._connect() as connection:
+            with connection.cursor() as cur:
+                cur.execute(
+                    f"SELECT id FROM {DB_AUDIO_BLOB_TABLE} WHERE id_cell_trans = %s",
+                    (transcription_id,),
+                )
+                row = cur.fetchone()
+        if row is None:
+            return None
+        return int(row["id"])
+
+    def sync_document(self, transcript_doc: Dict[str, Any]) -> Dict[str, Optional[int]]:
+        db_info = ensure_db_storage_metadata(transcript_doc)
+        with self._connect() as connection:
+            with connection.cursor() as cur:
+                transcription_id = self._save_transcription(
+                    cur,
+                    transcript_doc,
+                    safe_int(db_info.get("transcription_id")),
+                )
+                db_info["transcription_id"] = transcription_id
+
+                analysis = transcript_doc.get("analysis")
+                if isinstance(analysis, dict):
+                    analysis_id = self._save_analysis(
+                        cur,
+                        transcription_id,
+                        transcript_doc,
+                        safe_int(db_info.get("analysis_id")),
+                    )
+                    db_info["analysis_id"] = analysis_id
+        return {
+            "transcription_id": safe_int(db_info.get("transcription_id")),
+            "analysis_id": safe_int(db_info.get("analysis_id")),
+        }
+
+    def sync_audio_blob(
+        self,
+        transcript_doc: Dict[str, Any],
+        audio_path: Path,
+    ) -> Dict[str, Optional[int]]:
+        db_info = ensure_db_storage_metadata(transcript_doc)
+        with self._connect() as connection:
+            with connection.cursor() as cur:
+                transcription_id = self._save_transcription(
+                    cur,
+                    transcript_doc,
+                    safe_int(db_info.get("transcription_id")),
+                )
+                db_info["transcription_id"] = transcription_id
+                source = transcript_doc.get("source")
+                if not isinstance(source, dict):
+                    source = {}
+                audio_blob_id = self._save_audio_blob(
+                    cur,
+                    transcription_id,
+                    audio_path,
+                    safe_int(db_info.get("audio_blob_id")),
+                    str(source.get("file_name_audio") or audio_path.name),
+                )
+                db_info["audio_blob_id"] = audio_blob_id
+        return {
+            "transcription_id": safe_int(db_info.get("transcription_id")),
+            "audio_blob_id": safe_int(db_info.get("audio_blob_id")),
+        }
+
+
+def ensure_db_storage_metadata(transcript_doc: Dict[str, Any]) -> Dict[str, Any]:
+    storage = transcript_doc.get("storage")
+    if not isinstance(storage, dict):
+        storage = {}
+        transcript_doc["storage"] = storage
+    db_info = storage.get("db")
+    if not isinstance(db_info, dict):
+        db_info = {}
+        storage["db"] = db_info
+    return db_info
+
+
+def sync_transcript_doc_to_db(
+    db_store: DatabaseStore,
+    transcript_doc: Dict[str, Any],
+) -> Dict[str, Optional[int]]:
+    return db_store.sync_document(transcript_doc)
+
+
+def sync_audio_blob_to_db(
+    db_store: DatabaseStore,
+    transcript_doc: Dict[str, Any],
+    audio_path: Path,
+) -> Dict[str, Optional[int]]:
+    return db_store.sync_audio_blob(transcript_doc, audio_path)
 
 
 def build_openai_timeout(cfg: Config) -> httpx.Timeout:
@@ -2136,6 +2831,69 @@ def remote_upload_json(
     ftp_upload_json(cfg, remote_path, payload)
 
 
+def persist_processing_document(
+    cfg: Config,
+    remote_path: str,
+    transcript_doc: Dict[str, Any],
+    backend: str = REMOTE_BACKEND_FTP,
+    db_store: Optional[DatabaseStore] = None,
+) -> None:
+    if db_store is not None:
+        sync_transcript_doc_to_db(db_store, transcript_doc)
+    remote_upload_json(
+        cfg,
+        remote_path,
+        transcript_doc,
+        backend=backend,
+    )
+
+
+def ensure_audio_blob_persisted(
+    cfg: Config,
+    remote_file: Dict[str, Any],
+    transcript_doc: Optional[Dict[str, Any]],
+    db_store: Optional[DatabaseStore],
+    backend: str = REMOTE_BACKEND_FTP,
+) -> None:
+    if db_store is None or not isinstance(transcript_doc, dict):
+        return
+
+    db_info = ensure_db_storage_metadata(transcript_doc)
+    transcription_id = safe_int(db_info.get("transcription_id"))
+    audio_blob_id = safe_int(db_info.get("audio_blob_id"))
+    if transcription_id is not None and audio_blob_id is not None:
+        return
+
+    if transcription_id is None:
+        sync_transcript_doc_to_db(db_store, transcript_doc)
+        transcription_id = safe_int(db_info.get("transcription_id"))
+        audio_blob_id = safe_int(db_info.get("audio_blob_id"))
+        if transcription_id is None:
+            return
+        if audio_blob_id is not None:
+            return
+
+    existing_audio_blob_id = db_store.get_audio_blob_id(transcription_id)
+    if existing_audio_blob_id is not None:
+        db_info["audio_blob_id"] = existing_audio_blob_id
+        return
+
+    with tempfile.TemporaryDirectory(dir=cfg.work_root) as tmp_dir_name:
+        tmp_dir = Path(tmp_dir_name)
+        local_audio = tmp_dir / remote_file["name"]
+        logging.info(
+            "Downloading audio for PostgreSQL blob sync: %s",
+            remote_file["path"],
+        )
+        remote_download_file(
+            cfg,
+            remote_file["path"],
+            local_audio,
+            backend=backend,
+        )
+        sync_audio_blob_to_db(db_store, transcript_doc, local_audio)
+
+
 def remote_load_json(
     cfg: Config,
     remote_path: str,
@@ -2758,6 +3516,7 @@ def transcribe_part(client: OpenAIClients, audio_path: Path, cfg: Config) -> Dic
         "dialogue_text": dialogue_text,
         "segments": segments,
         "usage": data.get("usage") or {},
+        "raw_response": data,
     }
 
 
@@ -3345,6 +4104,7 @@ def process_remote_audio(
     instruction_text: str,
     state: Dict[str, Any],
     remote_file: Dict[str, Any],
+    db_store: Optional[DatabaseStore] = None,
 ) -> None:
     remote_backend = remote_file_backend(remote_file)
     remote_audio_path = remote_file["path"]
@@ -3367,6 +4127,13 @@ def process_remote_audio(
             remote_backend=remote_backend,
         )
         if reusable_telegram_message:
+            ensure_audio_blob_persisted(
+                cfg,
+                remote_file,
+                transcript_doc,
+                db_store,
+                backend=remote_backend,
+            )
             logging.info(
                 "Reusing saved analysis and retrying Telegram only: %s",
                 remote_audio_path,
@@ -3383,11 +4150,12 @@ def process_remote_audio(
             }
             transcript_doc["stage"] = "done"
             transcript_doc["status"] = "ok"
-            remote_upload_json(
+            persist_processing_document(
                 cfg,
                 remote_json_path,
                 transcript_doc,
                 backend=remote_backend,
+                db_store=db_store,
             )
 
             entry["stage"] = "done"
@@ -3415,6 +4183,13 @@ def process_remote_audio(
         )
         if reusable_transcript_doc is not None:
             transcript_doc = reusable_transcript_doc
+            ensure_audio_blob_persisted(
+                cfg,
+                remote_file,
+                transcript_doc,
+                db_store,
+                backend=remote_backend,
+            )
             logging.info(
                 "Reusing saved transcription and resuming downstream steps: %s",
                 remote_audio_path,
@@ -3477,6 +4252,8 @@ def process_remote_audio(
                             planned_parts_count=len(part_descriptors),
                             split_applied=len(part_descriptors) > 1,
                         )
+                        if db_store is not None:
+                            sync_audio_blob_to_db(db_store, transcript_doc, local_audio)
                         raise
 
                     part_finished_at = now_iso()
@@ -3502,11 +4279,14 @@ def process_remote_audio(
                     planned_parts_count=len(part_descriptors),
                     split_applied=len(part_descriptors) > 1,
                 )
-            remote_upload_json(
+                if db_store is not None:
+                    sync_audio_blob_to_db(db_store, transcript_doc, local_audio)
+            persist_processing_document(
                 cfg,
                 remote_json_path,
                 transcript_doc,
                 backend=remote_backend,
+                db_store=db_store,
             )
 
         word_count = int(transcript_doc["transcription"].get("word_count") or 0)
@@ -3538,11 +4318,12 @@ def process_remote_audio(
             }
             transcript_doc["stage"] = "done"
             transcript_doc["status"] = "ok"
-            remote_upload_json(
+            persist_processing_document(
                 cfg,
                 remote_json_path,
                 transcript_doc,
                 backend=remote_backend,
+                db_store=db_store,
             )
 
             entry["stage"] = "done"
@@ -3585,11 +4366,12 @@ def process_remote_audio(
         }
         transcript_doc["stage"] = "analyzed"
         transcript_doc["status"] = "analyzed"
-        remote_upload_json(
+        persist_processing_document(
             cfg,
             remote_json_path,
             transcript_doc,
             backend=remote_backend,
+            db_store=db_store,
         )
 
         logging.info("Sending Telegram message: %s", remote_audio_path)
@@ -3604,11 +4386,12 @@ def process_remote_audio(
         }
         transcript_doc["stage"] = "done"
         transcript_doc["status"] = "ok"
-        remote_upload_json(
+        persist_processing_document(
             cfg,
             remote_json_path,
             transcript_doc,
             backend=remote_backend,
+            db_store=db_store,
         )
 
         entry["stage"] = "done"
@@ -3654,11 +4437,12 @@ def process_remote_audio(
                 "updated_at": now_iso(),
             }
         try:
-            remote_upload_json(
+            persist_processing_document(
                 cfg,
                 remote_json_path,
                 error_doc,
                 backend=remote_backend,
+                db_store=db_store,
             )
         except Exception:
             logging.exception("Could not upload error JSON for %s", remote_audio_path)
@@ -3669,6 +4453,7 @@ def should_process_file(
     remote_files_by_path: Dict[str, Dict[str, Any]],
     state: Dict[str, Any],
     cfg: Config,
+    db_store: Optional[DatabaseStore] = None,
 ) -> bool:
     remote_backend = remote_file_backend(remote_file)
     remote_audio_path = remote_file["path"]
@@ -3748,7 +4533,7 @@ def should_process_file(
         reason = f"audio file smaller than {cfg.min_audio_bytes} bytes"
         if not remote_json_meta:
             try:
-                remote_upload_json(
+                persist_processing_document(
                     cfg,
                     remote_json_path,
                     build_skip_document(
@@ -3757,6 +4542,7 @@ def should_process_file(
                         reason,
                     ),
                     backend=remote_backend,
+                    db_store=db_store,
                 )
             except Exception:
                 logging.exception(
@@ -3777,7 +4563,12 @@ def should_process_file(
     return True
 
 
-def scan_cycle(cfg: Config, client: OpenAIClients, state: Dict[str, Any]) -> None:
+def scan_cycle(
+    cfg: Config,
+    client: OpenAIClients,
+    state: Dict[str, Any],
+    db_store: Optional[DatabaseStore] = None,
+) -> None:
     instruction_text = load_instruction_text(cfg.instruction_json_path)
     try:
         all_files = remote_walk(cfg)
@@ -3797,7 +4588,13 @@ def scan_cycle(cfg: Config, client: OpenAIClients, state: Dict[str, Any]) -> Non
     processable_files = [
         remote_file
         for remote_file in audio_files
-        if should_process_file(remote_file, remote_files_by_path, state, cfg)
+        if should_process_file(
+            remote_file,
+            remote_files_by_path,
+            state,
+            cfg,
+            db_store=db_store,
+        )
     ]
     save_state(cfg.state_path, state)
 
@@ -3834,7 +4631,14 @@ def scan_cycle(cfg: Config, client: OpenAIClients, state: Dict[str, Any]) -> Non
             )
             break
         save_state(cfg.state_path, state)
-        process_remote_audio(cfg, client, instruction_text, state, remote_file)
+        process_remote_audio(
+            cfg,
+            client,
+            instruction_text,
+            state,
+            remote_file,
+            db_store=db_store,
+        )
 
     save_state(cfg.state_path, state)
     logging.info("Cycle finished.")
@@ -3843,10 +4647,22 @@ def scan_cycle(cfg: Config, client: OpenAIClients, state: Dict[str, Any]) -> Non
 def main() -> None:
     setup_logging()
     cfg = Config.from_env()
+    db_store: Optional[DatabaseStore] = None
     openai_http_clients: List[httpx.Client] = []
 
     cfg.work_root.mkdir(parents=True, exist_ok=True)
     ensure_parent_dir(cfg.state_path)
+    if cfg.db_enabled:
+        db_store = DatabaseStore.from_config(cfg)
+        logging.info(
+            "PostgreSQL storage is enabled: %s@%s:%s/%s",
+            cfg.db_user,
+            cfg.db_host,
+            cfg.db_port,
+            cfg.db_name,
+        )
+    else:
+        logging.warning("PostgreSQL storage is disabled. Set DB_ENABLED=1 and DB_* vars.")
 
     if not cfg.ftp_enabled and not cfg.yandex_disk_enabled:
         raise ValueError(
@@ -3923,13 +4739,15 @@ def main() -> None:
         )
         while True:
             try:
-                scan_cycle(cfg, client, state)
+                scan_cycle(cfg, client, state, db_store=db_store)
             except KeyboardInterrupt:
                 raise
             except Exception:
                 logging.exception("Cycle crashed")
             time.sleep(cfg.poll_interval_sec)
     finally:
+        if db_store is not None:
+            db_store.close()
         for http_client in openai_http_clients:
             http_client.close()
 

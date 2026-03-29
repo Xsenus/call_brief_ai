@@ -1,4 +1,5 @@
 import unittest
+import json
 from pathlib import Path
 from unittest import mock
 import tempfile
@@ -58,6 +59,15 @@ def make_config(**overrides):
         "instruction_json_path": Path("instructions.json"),
         "state_path": Path("state.json"),
         "work_root": Path("work"),
+        "db_enabled": True,
+        "db_host": "127.0.0.1",
+        "db_port": 5432,
+        "db_name": "call_brief_ai_test",
+        "db_admin_db": "postgres",
+        "db_user": "postgres",
+        "db_password": "postgres",
+        "db_sslmode": "disable",
+        "db_connect_timeout_sec": 10,
         "telegram_bot_token": "123:test",
         "telegram_chat_id": "-1001",
         "telegram_message_thread_id": None,
@@ -514,6 +524,247 @@ class ResumeProcessingTests(unittest.TestCase):
             self.assertEqual(saved_doc["status"], "ok")
 
 
+class DatabaseStoreTests(unittest.TestCase):
+    def test_ensure_postgres_database_creates_missing_db(self):
+        cfg = make_config()
+        connect_cm = mock.MagicMock()
+        admin_connection = mock.MagicMock()
+        connect_cm.__enter__.return_value = admin_connection
+        admin_cursor = admin_connection.cursor.return_value.__enter__.return_value
+        admin_cursor.fetchone.return_value = None
+
+        with mock.patch("callbot_daemon.psycopg.connect", return_value=connect_cm) as mocked_connect:
+            created = daemon.ensure_postgres_database(cfg)
+
+        self.assertTrue(created)
+        self.assertEqual(mocked_connect.call_args.kwargs["dbname"], "postgres")
+        self.assertTrue(mocked_connect.call_args.kwargs["autocommit"])
+        self.assertEqual(admin_cursor.execute.call_count, 2)
+        self.assertIn("CREATE DATABASE", str(admin_cursor.execute.call_args_list[1].args[0]))
+
+    def test_sync_transcript_doc_to_db_updates_storage_ids(self):
+        cfg = make_config()
+        db_store = daemon.DatabaseStore(cfg=cfg)
+        connect_cm = mock.MagicMock()
+        connection = mock.MagicMock()
+        connect_cm.__enter__.return_value = connection
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.side_effect = [{"id": 11}, {"id": 22}]
+
+        transcript_doc = {
+            "generated_at": "2026-03-23T00:00:00+00:00",
+            "stage": "analyzed",
+            "status": "analyzed",
+            "source": {
+                "storage_backend": daemon.REMOTE_BACKEND_FTP,
+                "source_path_audio": "/recordings/call.mp3",
+                "ftp_path_audio": "/recordings/call.mp3",
+                "file_name_audio": "call.mp3",
+            },
+            "transcription": {
+                "dialogue_text": "Person 1: test",
+                "full_text": "test",
+            },
+            "analysis": {
+                "telegram_message": "Ready message",
+                "generated_at": "2026-03-23T00:00:01+00:00",
+            },
+            "telegram": {"sent": True, "updated_at": "2026-03-23T00:00:02+00:00"},
+        }
+
+        with mock.patch.object(db_store, "_connect", return_value=connect_cm):
+            ids = daemon.sync_transcript_doc_to_db(db_store, transcript_doc)
+
+        self.assertEqual(ids, {"transcription_id": 11, "analysis_id": 22})
+        self.assertEqual(transcript_doc["storage"]["db"]["transcription_id"], 11)
+        self.assertEqual(transcript_doc["storage"]["db"]["analysis_id"], 22)
+        self.assertGreaterEqual(cursor.execute.call_count, 2)
+
+    def test_sync_audio_blob_to_db_updates_storage_blob_id(self):
+        cfg = make_config()
+        db_store = daemon.DatabaseStore(cfg=cfg)
+        connect_cm = mock.MagicMock()
+        connection = mock.MagicMock()
+        connect_cm.__enter__.return_value = connection
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.side_effect = [{"id": 11}, {"id": 33}]
+
+        transcript_doc = {
+            "generated_at": "2026-03-23T00:00:00+00:00",
+            "stage": "transcribed",
+            "status": "transcribed",
+            "source": {
+                "storage_backend": daemon.REMOTE_BACKEND_FTP,
+                "source_path_audio": "/recordings/call.mp3",
+                "ftp_path_audio": "/recordings/call.mp3",
+                "file_name_audio": "call.mp3",
+            },
+            "transcription": {"dialogue_text": "test", "full_text": "test"},
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = Path(temp_dir) / "call.mp3"
+            audio_path.write_bytes(b"fake-audio")
+
+            with mock.patch.object(db_store, "_connect", return_value=connect_cm):
+                ids = daemon.sync_audio_blob_to_db(db_store, transcript_doc, audio_path)
+
+        self.assertEqual(ids, {"transcription_id": 11, "audio_blob_id": 33})
+        self.assertEqual(transcript_doc["storage"]["db"]["transcription_id"], 11)
+        self.assertEqual(transcript_doc["storage"]["db"]["audio_blob_id"], 33)
+        self.assertGreaterEqual(cursor.execute.call_count, 2)
+
+    def test_process_remote_audio_persists_delivery_state_to_db(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cfg = make_config(
+                state_path=Path(temp_dir) / "state.json",
+                work_root=Path(temp_dir),
+                min_dialogue_words=1,
+            )
+            state = {"files": {}}
+            remote_file = {
+                "path": "/recordings/call.mp3",
+                "name": "call.mp3",
+                "size": 123456,
+                "modify": "20260323070000",
+            }
+            saved_doc = {
+                "generated_at": "2026-03-23T00:00:00+00:00",
+                "stage": "error",
+                "status": "error",
+                "source": {"ftp_path_audio": "/recordings/call.mp3"},
+                "transcription": {
+                    "dialogue_text": "Person 1: test",
+                    "full_text": "test",
+                    "word_count": 1,
+                    "duration_min_total": 1.0,
+                    "parts_planned": 1,
+                    "parts_completed": 1,
+                    "parts_failed": 0,
+                    "parts": [{"status": "ok"}],
+                },
+            }
+            db_store = mock.Mock()
+
+            synced_docs = []
+
+            def capture_sync(_store, doc):
+                synced_docs.append(json.loads(json.dumps(doc)))
+                return {"transcription_id": 11, "analysis_id": 22}
+
+            with (
+                mock.patch("callbot_daemon.remote_load_json", return_value=saved_doc),
+                mock.patch(
+                    "callbot_daemon.analyze_transcript",
+                    return_value="Ready message",
+                ),
+                mock.patch(
+                    "callbot_daemon.send_telegram_message",
+                    return_value=[{"result": {"message_id": 7}}],
+                ),
+                mock.patch("callbot_daemon.remote_upload_json"),
+                mock.patch("callbot_daemon.remote_archive_or_delete"),
+                mock.patch(
+                    "callbot_daemon.sync_transcript_doc_to_db",
+                    side_effect=capture_sync,
+                ) as mocked_sync,
+            ):
+                daemon.process_remote_audio(
+                    cfg=cfg,
+                    client=mock.Mock(),
+                    instruction_text="Instruction",
+                    state=state,
+                    remote_file=remote_file,
+                    db_store=db_store,
+                )
+
+        self.assertGreaterEqual(mocked_sync.call_count, 2)
+        self.assertTrue(any(doc.get("telegram", {}).get("sent") is True for doc in synced_docs))
+        self.assertTrue(any(doc.get("analysis", {}).get("telegram_message") == "Ready message" for doc in synced_docs))
+
+    def test_process_remote_audio_saves_audio_blob_on_fresh_processing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cfg = make_config(
+                state_path=Path(temp_dir) / "state.json",
+                work_root=Path(temp_dir),
+                min_dialogue_words=1,
+            )
+            state = {"files": {}}
+            remote_file = {
+                "path": "/recordings/call.mp3",
+                "name": "call.mp3",
+                "size": 123456,
+                "modify": "20260323070000",
+            }
+            db_store = mock.Mock()
+
+            def fake_download(_cfg, _remote_path, local_path, backend=None):
+                local_path.write_bytes(b"original-audio")
+
+            def fake_prepare(local_audio, tmp_dir, _cfg):
+                part_path = tmp_dir / "part_001.mp3"
+                part_path.write_bytes(b"part-audio")
+                return [part_path]
+
+            synced_audio = []
+
+            def capture_audio_blob(_store, doc, audio_path):
+                synced_audio.append(
+                    {
+                        "audio_path": audio_path.name,
+                        "source_file": doc.get("source", {}).get("file_name_audio"),
+                    }
+                )
+                doc.setdefault("storage", {}).setdefault("db", {})["audio_blob_id"] = 44
+                return {"transcription_id": 11, "audio_blob_id": 44}
+
+            with (
+                mock.patch("callbot_daemon.remote_load_json", return_value=None),
+                mock.patch("callbot_daemon.remote_download_file", side_effect=fake_download),
+                mock.patch("callbot_daemon.prepare_audio_parts", side_effect=fake_prepare),
+                mock.patch(
+                    "callbot_daemon.transcribe_part",
+                    return_value={
+                        "file_name": "part_001.mp3",
+                        "size_bytes": 10,
+                        "duration_sec": 61.0,
+                        "full_text": "hello",
+                        "dialogue_text": "Person 1: hello",
+                        "segments": [{"speaker": "A", "text": "hello", "start": 0.0, "end": 1.0}],
+                        "usage": {},
+                        "raw_response": {"text": "hello"},
+                    },
+                ),
+                mock.patch("callbot_daemon.analyze_transcript", return_value="Ready message"),
+                mock.patch(
+                    "callbot_daemon.send_telegram_message",
+                    return_value=[{"result": {"message_id": 7}}],
+                ),
+                mock.patch("callbot_daemon.remote_upload_json"),
+                mock.patch("callbot_daemon.remote_archive_or_delete"),
+                mock.patch(
+                    "callbot_daemon.sync_audio_blob_to_db",
+                    side_effect=capture_audio_blob,
+                ) as mocked_sync_audio,
+                mock.patch(
+                    "callbot_daemon.sync_transcript_doc_to_db",
+                    return_value={"transcription_id": 11, "analysis_id": 22},
+                ),
+            ):
+                daemon.process_remote_audio(
+                    cfg=cfg,
+                    client=mock.Mock(),
+                    instruction_text="Instruction",
+                    state=state,
+                    remote_file=remote_file,
+                    db_store=db_store,
+                )
+
+        self.assertGreaterEqual(mocked_sync_audio.call_count, 1)
+        self.assertEqual(synced_audio[0]["audio_path"], "call.mp3")
+        self.assertEqual(synced_audio[0]["source_file"], "call.mp3")
+
+
 class TranscriptDocumentTests(unittest.TestCase):
     def test_build_transcript_document_aggregates_usage_and_part_metadata(self):
         cfg = make_config()
@@ -726,6 +977,64 @@ class ConfigDefaultsTests(unittest.TestCase):
         self.assertTrue(cfg.yandex_disk_enabled)
         self.assertEqual(cfg.yandex_disk_remote_roots, ["disk:/mango/records"])
         self.assertEqual(cfg.yandex_disk_remote_root, "disk:/mango/records")
+
+    def test_from_env_enables_postgres_storage_when_db_vars_present(self):
+        env = {
+            "OPENAI_API_KEY": "sk-test",
+            "FTP_HOST": "example.com",
+            "FTP_USER": "user",
+            "FTP_PASSWORD": "pass",
+            "TELEGRAM_BOT_TOKEN": "123:test",
+            "TELEGRAM_CHAT_ID": "-1001",
+            "FTP_REMOTE_ROOT": "/recordings",
+            "DB_ENABLED": "1",
+            "DB_HOST": "127.0.0.1",
+            "DB_PORT": "5432",
+            "DB_NAME": "call_brief_ai",
+            "DB_ADMIN_DB": "postgres",
+            "DB_USER": "postgres",
+            "DB_PASSWORD": "postgres",
+            "DB_SSLMODE": "disable",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=True):
+            cfg = daemon.Config.from_env()
+
+        self.assertTrue(cfg.db_enabled)
+        self.assertEqual(cfg.db_host, "127.0.0.1")
+        self.assertEqual(cfg.db_port, 5432)
+        self.assertEqual(cfg.db_name, "call_brief_ai")
+        self.assertEqual(cfg.db_admin_db, "postgres")
+        self.assertEqual(cfg.db_user, "postgres")
+        self.assertEqual(cfg.db_sslmode, "disable")
+
+    def test_from_env_supports_postgres_database_url(self):
+        env = {
+            "OPENAI_API_KEY": "sk-test",
+            "FTP_HOST": "example.com",
+            "FTP_USER": "user",
+            "FTP_PASSWORD": "pass",
+            "TELEGRAM_BOT_TOKEN": "123:test",
+            "TELEGRAM_CHAT_ID": "-1001",
+            "FTP_REMOTE_ROOT": "/recordings",
+            "DB_ENABLED": "1",
+            "POSTGRES_DATABASE_URL": (
+                "postgresql+asyncpg://admin:secret@db.example.com:5544/call_brief_ai"
+                "?sslmode=disable&connect_timeout=15"
+            ),
+        }
+
+        with mock.patch.dict("os.environ", env, clear=True):
+            cfg = daemon.Config.from_env()
+
+        self.assertTrue(cfg.db_enabled)
+        self.assertEqual(cfg.db_host, "db.example.com")
+        self.assertEqual(cfg.db_port, 5544)
+        self.assertEqual(cfg.db_name, "call_brief_ai")
+        self.assertEqual(cfg.db_user, "admin")
+        self.assertEqual(cfg.db_password, "secret")
+        self.assertEqual(cfg.db_sslmode, "disable")
+        self.assertEqual(cfg.db_connect_timeout_sec, 15)
 
 
 class RemoteScanExclusionTests(unittest.TestCase):

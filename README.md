@@ -12,7 +12,8 @@
 6. Собирает единый JSON разговора и сохраняет его рядом с аудио на том же источнике: FTP, SFTP или Яндекс Диск.
 7. Отправляет JSON разговора в OpenAI Responses API и получает готовый текст для Telegram.
 8. Публикует сообщение в Telegram от имени бота.
-9. По настройке оставляет исходный файл, переносит его в архив или удаляет.
+9. Сохраняет транскрибацию, анализ и статус доставки в PostgreSQL.
+10. По настройке оставляет исходный файл, переносит его в архив или удаляет.
 
 ## Как устроен цикл обработки
 
@@ -42,7 +43,7 @@ MIN_STABLE_POLLS=1
 
 ## Где хранится состояние
 
-Сервис хранит данные в двух местах.
+Сервис хранит данные в трех местах.
 
 ### 1. Локальное служебное состояние
 
@@ -86,6 +87,46 @@ MIN_STABLE_POLLS=1
 - блок `telegram`
 
 Если рядом с аудио уже лежит одноименный `*.json`, сервис считает запись уже обработанной и заново ее не берет.
+
+### 3. PostgreSQL
+
+Если включен `DB_ENABLED=1`, daemon дополнительно пишет данные в PostgreSQL.
+
+Таблица `ai_cell_trans` хранит:
+
+- `id`
+- `created_datetime`
+- `updated_datetime`
+- `filename_mp3`
+- `source_path_audio`
+- `storage_backend`
+- `status`
+- `transcription_json` (`JSONB` со всем документом обработки, включая транскрибацию, сегменты, usage и служебные поля)
+
+Таблица `ai_cell_analisys` хранит:
+
+- `id`
+- `created_datetime`
+- `updated_datetime`
+- `id_cell_trans`
+- `text_bot`
+- `delivered_telegram`
+- `delivered_datetime`
+- `analysis_json` (`JSONB` с блоками `analysis` и `telegram`)
+
+Таблица `ai_cell_audio_blob` хранит:
+
+- `id`
+- `created_datetime`
+- `updated_datetime`
+- `id_cell_trans`
+- `filename_mp3`
+- `mime_type`
+- `size_bytes`
+- `sha256_hex`
+- `audio_blob` (`BYTEA` с бинарным содержимым исходного аудиофайла)
+
+Важно: теперь в PostgreSQL хранится и сам исходный аудиофайл в отдельной таблице `ai_cell_audio_blob`. При этом файл по-прежнему остается в исходном хранилище `FTP/SFTP/Яндекс Диск`, если это разрешено настройками архивации/удаления.
 
 ## Как заново обработать один звонок
 
@@ -208,6 +249,17 @@ INSTRUCTIONS_JSON_PATH=/opt/call_brief_ai/shared/instructions.json
 INSTRUCTION_JSON_PATH=/opt/call_brief_ai/shared/instructions.json
 STATE_PATH=/opt/call_brief_ai/shared/state.json
 WORK_ROOT=/opt/call_brief_ai/shared/work
+
+POSTGRES_DATABASE_URL=postgresql+asyncpg://callbot_user:change-me@127.0.0.1:5432/call_brief_ai
+DB_ENABLED=1
+DB_HOST=127.0.0.1
+DB_PORT=5432
+DB_NAME=call_brief_ai
+DB_ADMIN_DB=postgres
+DB_USER=callbot_user
+DB_PASSWORD=change-me
+DB_SSLMODE=prefer
+DB_CONNECT_TIMEOUT_SEC=10
 
 TELEGRAM_BOT_TOKEN=123456789:ABCDEF...
 TELEGRAM_CHAT_ID=-1001234567890

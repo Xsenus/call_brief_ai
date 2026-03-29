@@ -44,6 +44,7 @@
 - OpenAI API key
 - Telegram bot token
 - FTP или SFTP доступ к хранилищу записей
+- PostgreSQL доступ для сохранения транскрибаций и анализа
 
 ## 1. Подготовьте VPS
 
@@ -125,6 +126,17 @@ INSTRUCTIONS_JSON_PATH=/opt/call_brief_ai/shared/instructions.json
 INSTRUCTION_JSON_PATH=/opt/call_brief_ai/shared/instructions.json
 STATE_PATH=/opt/call_brief_ai/shared/state.json
 WORK_ROOT=/opt/call_brief_ai/shared/work
+
+POSTGRES_DATABASE_URL=postgresql+asyncpg://callbot_user:change-me@127.0.0.1:5432/call_brief_ai
+DB_ENABLED=1
+DB_HOST=127.0.0.1
+DB_PORT=5432
+DB_NAME=call_brief_ai
+DB_ADMIN_DB=postgres
+DB_USER=callbot_user
+DB_PASSWORD=change-me
+DB_SSLMODE=prefer
+DB_CONNECT_TIMEOUT_SEC=10
 
 TELEGRAM_BOT_TOKEN=123456789:ABCDEF...
 TELEGRAM_CHAT_ID=-1001234567890
@@ -369,10 +381,11 @@ systemctl status callbot.service --no-pager
 
 ## 13. Где хранится состояние обработки
 
-Сервис хранит состояние в двух местах:
+Сервис хранит состояние в трех местах:
 
 - `/opt/call_brief_ai/shared/state.json`
 - `*.json` рядом с аудио на FTP/SFTP
+- PostgreSQL: таблицы `ai_cell_trans`, `ai_cell_analisys` и `ai_cell_audio_blob`
 
 Удаление только `/opt/call_brief_ai/shared/state.json` не запускает повторную обработку, если рядом с аудио уже лежит одноименный `*.json`.
 
@@ -380,6 +393,10 @@ systemctl status callbot.service --no-pager
 
 1. запись о файле из `state.json`
 2. одноименный `*.json` рядом с исходным `*.mp3`
+
+PostgreSQL очищать необязательно: при повторной обработке daemon обновит существующие строки по `storage_backend + source_path_audio` и по `id_cell_trans`.
+
+Важно: теперь daemon сохраняет и сам бинарный `*.mp3` в PostgreSQL, в отдельной таблице `ai_cell_audio_blob`. JSON-данные обработки и текст для бота по-прежнему лежат отдельно в `ai_cell_trans` и `ai_cell_analisys`.
 
 ## 14. Как получить `TELEGRAM_CHAT_ID`
 
