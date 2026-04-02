@@ -57,6 +57,7 @@ def make_config(**overrides):
         "analysis_store": False,
         "analysis_max_output_tokens": 1800,
         "instruction_json_path": Path("instructions.json"),
+        "instruction_prompt_mode": "raw",
         "state_path": Path("state.json"),
         "work_root": Path("work"),
         "db_enabled": True,
@@ -165,6 +166,71 @@ class InspectResponseOutputTests(unittest.TestCase):
         )
 
         self.assertEqual(message, "")
+
+
+class InstructionLoadingTests(unittest.TestCase):
+    def test_load_instruction_text_raw_mode_preserves_existing_behavior(self):
+        payload = {
+            "instruction_name": "rich-json",
+            "analyzer_role": "Analyze calls",
+            "main_goal": "Return structured output",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "instructions.json"
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            text = daemon.load_instruction_text(path, "raw")
+
+        self.assertEqual(
+            text,
+            json.dumps(payload, ensure_ascii=False, indent=2).strip(),
+        )
+
+    def test_load_instruction_text_rendered_mode_builds_structured_prompt(self):
+        payload = {
+            "instruction_name": "rich-json",
+            "analyzer_role": "Analyze cryoblasting sales calls",
+            "main_goal": "Route the call before choosing output depth",
+            "core_routing_rule": "Only type 5 receives the full scorecard.",
+            "transcript_handling_rules": ["Identify speakers first."],
+            "call_type_routing": {
+                "required_primary_types": [
+                    {"id": "5_cold_outbound_dmp", "label": "cold outbound to DMP"}
+                ]
+            },
+            "final_quality_checks": ["Do not skip routing."],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "instructions.json"
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            text = daemon.load_instruction_text(path, "rendered")
+
+        self.assertIn("Instruction profile:\nrich-json", text)
+        self.assertIn("Analyzer role:\nAnalyze cryoblasting sales calls", text)
+        self.assertIn(
+            "Core routing rule:\nOnly type 5 receives the full scorecard.",
+            text,
+        )
+        self.assertIn("Call type routing:", text)
+        self.assertIn('"id": "5_cold_outbound_dmp"', text)
+        self.assertIn("Execution rules:", text)
+
+    def test_load_instruction_text_rendered_mode_keeps_direct_prompt_fields(self):
+        payload = {"instructions": "Use this exact prompt."}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "instructions.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+            text = daemon.load_instruction_text(path, "rendered")
+
+        self.assertEqual(text, "Use this exact prompt.")
 
 
 class AnalysisRetryTests(unittest.TestCase):

@@ -717,6 +717,7 @@ class Config:
     analysis_store: bool
     analysis_max_output_tokens: int
     instruction_json_path: Path
+    instruction_prompt_mode: str
     state_path: Path
     work_root: Path
     db_enabled: bool
@@ -844,6 +845,13 @@ class Config:
         analysis_reasoning_effort_raw = os.getenv(
             "OPENAI_ANALYSIS_REASONING_EFFORT", ""
         ).strip()
+        instruction_prompt_mode = (
+            os.getenv("INSTRUCTION_PROMPT_MODE", "raw").strip().lower() or "raw"
+        )
+        if instruction_prompt_mode not in {"raw", "rendered"}:
+            raise ValueError(
+                "INSTRUCTION_PROMPT_MODE must be either 'raw' or 'rendered'"
+            )
         db_url = (
             os.getenv("POSTGRES_DATABASE_URL")
             or os.getenv("DATABASE_URL")
@@ -1021,6 +1029,7 @@ class Config:
             )
             .expanduser()
             .resolve(),
+            instruction_prompt_mode=instruction_prompt_mode,
             state_path=Path(os.getenv("STATE_PATH", "./state.json"))
             .expanduser()
             .resolve(),
@@ -1964,25 +1973,113 @@ def save_state(path: Path, state: Dict[str, Any]) -> None:
     tmp_path.replace(path)
 
 
-def load_instruction_text(path: Path) -> str:
+INSTRUCTION_TEXT_KEYS = (
+    "instructions",
+    "instruction",
+    "prompt",
+    "system_prompt",
+    "system",
+    "text",
+)
+
+
+def extract_direct_instruction_text(obj: Any) -> str:
+    if not isinstance(obj, dict):
+        return ""
+    for key in INSTRUCTION_TEXT_KEYS:
+        value = obj.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def render_instruction_object(obj: Dict[str, Any]) -> str:
+    direct_text = extract_direct_instruction_text(obj)
+    if direct_text:
+        return direct_text
+
+    sections: List[str] = []
+    profile_name = str(obj.get("instruction_name") or "").strip()
+    if profile_name:
+        sections.append(f"Instruction profile:\n{profile_name}")
+
+    scalar_sections = (
+        ("Analyzer role", "analyzer_role"),
+        ("Main goal", "main_goal"),
+        ("Core routing rule", "core_routing_rule"),
+        ("Evaluation scope rule", "evaluation_scope_rule"),
+        ("Input assumption", "input_assumption"),
+    )
+    consumed_keys = {
+        "instruction_name",
+        "recommended_send_as",
+        "language",
+    }
+    for label, key in scalar_sections:
+        consumed_keys.add(key)
+        value = obj.get(key)
+        if isinstance(value, str) and value.strip():
+            sections.append(f"{label}:\n{value.strip()}")
+
+    structured_sections = (
+        ("Transcript handling rules", "transcript_handling_rules"),
+        ("Call type routing", "call_type_routing"),
+        ("Conversation classification", "conversation_classification"),
+        ("Client data extraction", "client_data_extraction"),
+        ("Knowledge level scale", "knowledge_level_scale"),
+        ("Cryoblasting experience scale", "cryoblasting_experience_scale"),
+        ("Domain context", "domain_context"),
+        ("Evaluation model", "evaluation_model"),
+        ("Evidence rules", "evidence_rules"),
+        ("Output logic", "output_logic"),
+        ("Short output blueprints", "short_output_blueprints"),
+        ("Output requirements", "output_requirements"),
+        ("Output requirements for type 5", "output_requirements_for_type_5"),
+        ("Response blueprint", "response_blueprint"),
+        ("Response blueprint for type 5", "response_blueprint_for_type_5"),
+        ("Short post rules", "short_post_rules"),
+        ("Final quality checks", "final_quality_checks"),
+    )
+    for label, key in structured_sections:
+        consumed_keys.add(key)
+        value = obj.get(key)
+        if value in (None, "", [], {}):
+            continue
+        sections.append(
+            f"{label}:\n{json.dumps(value, ensure_ascii=False, indent=2)}"
+        )
+
+    extra_fields = {
+        key: value
+        for key, value in obj.items()
+        if key not in consumed_keys and value not in (None, "", [], {})
+    }
+    if extra_fields:
+        sections.append(
+            "Additional structured context:\n"
+            + json.dumps(extra_fields, ensure_ascii=False, indent=2)
+        )
+
+    sections.append(
+        "Execution rules:\n"
+        "Treat the sections above as the instruction hierarchy for the analysis. "
+        "Follow explicit routing rules before picking an output format."
+    )
+    return "\n\n".join(section for section in sections if section.strip()).strip()
+
+
+def load_instruction_text(path: Path, prompt_mode: str = "raw") -> str:
     raw = path.read_text(encoding="utf-8")
     try:
         obj = json.loads(raw)
     except json.JSONDecodeError:
         return raw.strip()
 
-    if isinstance(obj, dict):
-        for key in (
-            "instructions",
-            "instruction",
-            "prompt",
-            "system_prompt",
-            "system",
-            "text",
-        ):
-            value = obj.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
+    if prompt_mode == "rendered" and isinstance(obj, dict):
+        return render_instruction_object(obj)
+    direct_text = extract_direct_instruction_text(obj)
+    if direct_text:
+        return direct_text
     return raw.strip()
 
 
@@ -4762,7 +4859,10 @@ def scan_cycle(
     state: Dict[str, Any],
     db_store: Optional[DatabaseStore] = None,
 ) -> None:
-    instruction_text = load_instruction_text(cfg.instruction_json_path)
+    instruction_text = load_instruction_text(
+        cfg.instruction_json_path,
+        cfg.instruction_prompt_mode,
+    )
     try:
         all_files = remote_walk(cfg)
     except RemoteConnectionError as exc:
@@ -4899,6 +4999,11 @@ def main() -> None:
         raise FileNotFoundError(
             f"instructions file not found: {cfg.instruction_json_path}"
         )
+    logging.info(
+        "Instruction prompt mode: %s. Source: %s",
+        cfg.instruction_prompt_mode,
+        cfg.instruction_json_path,
+    )
 
     if cfg.openai_base_url:
         logging.info("Using custom OpenAI base URL: %s", cfg.openai_base_url)
