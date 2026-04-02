@@ -124,6 +124,7 @@ FTP_RETRY_DELAY_SEC=5
 
 INSTRUCTIONS_JSON_PATH=/opt/call_brief_ai/shared/instructions.json
 INSTRUCTION_JSON_PATH=/opt/call_brief_ai/shared/instructions.json
+INSTRUCTION_PROMPT_MODE=raw
 STATE_PATH=/opt/call_brief_ai/shared/state.json
 WORK_ROOT=/opt/call_brief_ai/shared/work
 
@@ -199,6 +200,27 @@ nano /opt/call_brief_ai/shared/instructions.json
   "instructions": "Сформируй готовое сообщение для Telegram на русском языке. Верни только текст сообщения без пояснений и без markdown-кода."
 }
 ```
+
+Если вы храните инструкцию как подробный JSON-профиль, а не как одно поле `instructions`, можно вручную переключить режим сборки prompt:
+
+```dotenv
+INSTRUCTION_PROMPT_MODE=raw
+```
+
+Режимы:
+
+- `raw` — поведение по умолчанию. Если в JSON есть ключ `instructions` / `instruction` / `prompt` / `system_prompt` / `system` / `text`, сервис берет его. Если таких ключей нет, в модель отправляется весь JSON целиком как текст.
+- `rendered` — сервис собирает prompt из структурированных секций JSON (`analyzer_role`, `main_goal`, `call_type_routing`, `evaluation_model`, `output_requirements` и др.) и отправляет уже готовый текст инструкции.
+
+Переключение на VPS:
+
+```bash
+nano /opt/call_brief_ai/shared/.env
+sudo systemctl restart callbot.service
+sudo journalctl -u callbot.service -n 20 --no-pager
+```
+
+При старте сервис пишет в лог, какой режим инструкции активен.
 
 ## 4. Подготовьте GitHub-репозиторий
 
@@ -291,6 +313,8 @@ Workflow из `.github/workflows/deploy.yml`:
 4. Собирает release archive без `.venv`, `.github`, `.env`, `work`, `state.json`.
 5. Копирует archive, `deploy/remote_deploy.sh` и `deploy/callbot.service` на VPS.
 6. Выполняет deploy-скрипт на VPS.
+
+Важно: production-сервис читает `.env` и `instructions.json` из каталога `shared`. Если `/opt/call_brief_ai/shared/instructions.json` уже существует и не пустой, deploy не заменяет его автоматически файлом из нового релиза. То есть push в `main` обновляет код и перезапускает сервис, но не обязательно обновляет боевой prompt.
 
 ## 9. Сколько релизов хранится
 

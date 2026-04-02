@@ -247,6 +247,7 @@ YANDEX_DISK_TIMEOUT_SEC=120
 
 INSTRUCTIONS_JSON_PATH=/opt/call_brief_ai/shared/instructions.json
 INSTRUCTION_JSON_PATH=/opt/call_brief_ai/shared/instructions.json
+INSTRUCTION_PROMPT_MODE=raw
 STATE_PATH=/opt/call_brief_ai/shared/state.json
 WORK_ROOT=/opt/call_brief_ai/shared/work
 
@@ -567,6 +568,40 @@ FTP_DELETE_AFTER_SUCCESS=0
 /opt/call_brief_ai/shared/instructions.json
 ```
 
+Дополнительно можно выбрать режим загрузки инструкции через `.env`:
+
+```dotenv
+INSTRUCTION_PROMPT_MODE=raw
+```
+
+Поддерживаются два режима:
+
+- `raw` — поведение по умолчанию. Сервис работает как раньше: если в JSON есть один из ключей `instructions` / `instruction` / `prompt` / `system_prompt` / `system` / `text`, берется значение этого ключа. Иначе в prompt уходит весь JSON целиком как текст.
+- `rendered` — для "богатых" JSON-инструкций. Сервис собирает prompt из ключевых секций (`analyzer_role`, `main_goal`, `call_type_routing`, `evaluation_model`, `output_requirements` и других) и отправляет в модель уже структурированный текст. Прямые ключи `instructions` / `prompt` и т.п. по-прежнему имеют приоритет.
+
+Это удобно, если вы хотите хранить инструкцию в подробном JSON-формате, но при необходимости вручную переключаться между старым и новым способом сборки prompt.
+
+Пример переключения на VPS:
+
+```bash
+nano /opt/call_brief_ai/shared/.env
+```
+
+Измените:
+
+```dotenv
+INSTRUCTION_PROMPT_MODE=rendered
+```
+
+И примените:
+
+```bash
+sudo systemctl restart callbot.service
+sudo journalctl -u callbot.service -n 20 --no-pager
+```
+
+В логах при старте сервис пишет, какой режим инструкции активен.
+
 ## Как получить `TELEGRAM_CHAT_ID`
 
 1. Добавьте бота в нужную группу или канал.
@@ -633,5 +668,11 @@ Workflow:
 - обновляет symlink `/opt/call_brief_ai/current`
 - перезапускает `callbot.service`
 - оставляет только последние `RELEASES_TO_KEEP` релизов
+
+Важно:
+
+- workflow обновляет код и релиз, но рабочий `instructions.json` обычно читается из `/opt/call_brief_ai/shared/instructions.json`
+- если этот файл на VPS уже существует и не пустой, deploy не перезаписывает его автоматически
+- поэтому изменение `instructions.json` в git не гарантирует автоматическое обновление боевого prompt на сервере без отдельного обновления файла в `shared`
 
 Подробный пошаговый гайд лежит в [DEPLOYMENT.md](DEPLOYMENT.md).
