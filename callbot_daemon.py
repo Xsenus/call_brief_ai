@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import hmac
+import html
 import io
 import hashlib
 import json
@@ -12,11 +14,13 @@ import ssl
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from ftplib import FTP, FTP_TLS, all_errors, error_perm
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 from urllib.parse import parse_qs, unquote, urlparse
@@ -737,6 +741,12 @@ class Config:
     telegram_chat_id: str
     telegram_message_thread_id: Optional[int]
     telegram_proxy: str
+    viewer_enabled: bool
+    viewer_host: str
+    viewer_port: int
+    viewer_route_prefix: str
+    viewer_public_base_url: str
+    viewer_secret: str
     poll_interval_sec: int
     min_stable_polls: int
     min_audio_bytes: int
@@ -886,6 +896,13 @@ class Config:
                 "or DB_HOST, DB_NAME, DB_USER and optionally DB_PASSWORD/DB_PORT/DB_SSLMODE, "
                 "or disable DB_ENABLED."
             )
+        viewer_route_prefix = (
+            os.getenv("VIEWER_ROUTE_PREFIX", "/audio/analysis").strip()
+            or "/audio/analysis"
+        )
+        if not viewer_route_prefix.startswith("/"):
+            raise ValueError("VIEWER_ROUTE_PREFIX must start with '/'")
+        viewer_route_prefix = viewer_route_prefix.rstrip("/") or "/audio/analysis"
         ftp_port_default = "22" if ftp_protocol == "sftp" else "21"
         return cls(
             ftp_enabled=ftp_enabled,
@@ -1069,6 +1086,12 @@ class Config:
             telegram_chat_id=os.environ["TELEGRAM_CHAT_ID"],
             telegram_message_thread_id=env_optional_int("TELEGRAM_MESSAGE_THREAD_ID"),
             telegram_proxy=os.getenv("TELEGRAM_PROXY", "").strip(),
+            viewer_enabled=env_bool("VIEWER_ENABLED", False),
+            viewer_host=os.getenv("VIEWER_HOST", "127.0.0.1").strip() or "127.0.0.1",
+            viewer_port=max(1, int(os.getenv("VIEWER_PORT", "8080"))),
+            viewer_route_prefix=viewer_route_prefix,
+            viewer_public_base_url=os.getenv("VIEWER_PUBLIC_BASE_URL", "").strip(),
+            viewer_secret=os.getenv("VIEWER_SECRET", "").strip(),
             poll_interval_sec=int(os.getenv("POLL_INTERVAL_SEC", "60")),
             min_stable_polls=int(os.getenv("MIN_STABLE_POLLS", "2")),
             min_audio_bytes=int(os.getenv("MIN_AUDIO_BYTES", str(100 * 1024))),
@@ -1338,6 +1361,60 @@ class DatabaseStore:
         if row is not None:
             return row.get("instruction_json"), True
         return self.get_instruction_payload(code), False
+
+    def get_transcription_view_record(
+        self,
+        transcription_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        with self._connect() as connection:
+            with connection.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT
+                        trans.id,
+                        trans.filename_mp3,
+                        trans.source_path_audio,
+                        trans.storage_backend,
+                        trans.created_datetime,
+                        trans.updated_datetime,
+                        trans.transcription_json,
+                        analysis.text_bot,
+                        analysis.analysis_json
+                    FROM {DB_TRANSCRIPTION_TABLE} AS trans
+                    LEFT JOIN {DB_ANALYSIS_TABLE} AS analysis
+                        ON analysis.id_cell_trans = trans.id
+                    WHERE trans.id = %s
+                    """,
+                    (transcription_id,),
+                )
+                row = cur.fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def get_audio_blob_record(
+        self,
+        transcription_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        with self._connect() as connection:
+            with connection.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT
+                        id,
+                        filename_mp3,
+                        mime_type,
+                        size_bytes,
+                        audio_blob
+                    FROM {DB_AUDIO_BLOB_TABLE}
+                    WHERE id_cell_trans = %s
+                    """,
+                    (transcription_id,),
+                )
+                row = cur.fetchone()
+        if row is None:
+            return None
+        return dict(row)
 
     def _save_transcription(
         self,
@@ -4501,7 +4578,10 @@ def extract_saved_telegram_message(
     analysis = transcript_doc.get("analysis")
     if not isinstance(analysis, dict):
         return ""
-    message = analysis.get("telegram_message")
+    message = (
+        analysis.get("telegram_message_rendered")
+        or analysis.get("telegram_message")
+    )
     if not isinstance(message, str):
         return ""
     return message.strip()
@@ -4542,6 +4622,433 @@ def send_telegram_message(cfg: Config, text: str) -> List[Dict[str, Any]]:
         results.append(data)
 
     return results
+
+
+def get_transcription_id_from_document(
+    transcript_doc: Optional[Dict[str, Any]],
+) -> Optional[int]:
+    if not isinstance(transcript_doc, dict):
+        return None
+    storage = transcript_doc.get("storage")
+    if not isinstance(storage, dict):
+        return None
+    db_info = storage.get("db")
+    if not isinstance(db_info, dict):
+        return None
+    return safe_int(db_info.get("transcription_id"))
+
+
+def viewer_supports_public_links(cfg: Config) -> bool:
+    return bool(cfg.viewer_public_base_url and cfg.viewer_secret)
+
+
+def viewer_supports_http_server(cfg: Config) -> bool:
+    return cfg.viewer_enabled and bool(cfg.viewer_secret)
+
+
+def build_viewer_token(transcription_id: int, secret: str) -> str:
+    payload = str(int(transcription_id))
+    signature = hmac.new(
+        secret.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{payload}.{signature}"
+
+
+def parse_viewer_token(token: str, secret: str) -> Optional[int]:
+    payload, separator, signature = str(token or "").strip().partition(".")
+    if separator != "." or not payload or not signature or not payload.isdigit():
+        return None
+    expected_signature = build_viewer_token(int(payload), secret).partition(".")[2]
+    if not hmac.compare_digest(expected_signature, signature):
+        return None
+    return int(payload)
+
+
+def build_public_view_url(
+    cfg: Config,
+    transcript_doc: Optional[Dict[str, Any]],
+) -> str:
+    if not viewer_supports_public_links(cfg):
+        return ""
+    transcription_id = get_transcription_id_from_document(transcript_doc)
+    if transcription_id is None:
+        return ""
+    base_url = cfg.viewer_public_base_url.rstrip("/")
+    token = build_viewer_token(transcription_id, cfg.viewer_secret)
+    return f"{base_url}{cfg.viewer_route_prefix}/{token}"
+
+
+def build_ready_telegram_message(
+    cfg: Config,
+    transcript_doc: Optional[Dict[str, Any]],
+    base_message: str,
+) -> str:
+    message = str(base_message or "").strip()
+    url = build_public_view_url(cfg, transcript_doc)
+    if not url:
+        return message
+    link_line = f"Аудио-запись и текст звонка: {url}"
+    if message.startswith(link_line):
+        return message
+    if not message:
+        return link_line
+    return f"{link_line}\n\n{message}"
+
+
+def extract_call_view_text(record: Dict[str, Any]) -> str:
+    transcription_json = record.get("transcription_json")
+    if not isinstance(transcription_json, dict):
+        return ""
+    transcription = transcription_json.get("transcription")
+    if not isinstance(transcription, dict):
+        return ""
+    for key in ("dialogue_text", "full_text"):
+        value = transcription.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def extract_call_view_summary(record: Dict[str, Any]) -> str:
+    analysis_json = record.get("analysis_json")
+    if isinstance(analysis_json, dict):
+        analysis = analysis_json.get("analysis")
+        if isinstance(analysis, dict):
+            for key in ("telegram_message_rendered", "telegram_message", "telegram_message_body"):
+                value = analysis.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    text_bot = record.get("text_bot")
+    if isinstance(text_bot, str) and text_bot.strip():
+        return text_bot.strip()
+    return ""
+
+
+def extract_call_view_meta(record: Dict[str, Any]) -> Dict[str, str]:
+    filename = str(record.get("filename_mp3") or "").strip() or "call"
+    storage_backend = str(record.get("storage_backend") or "").strip()
+    source_path_audio = str(record.get("source_path_audio") or "").strip()
+    created_datetime = str(record.get("created_datetime") or "").strip()
+    transcription_json = record.get("transcription_json")
+    source: Dict[str, Any] = {}
+    transcription: Dict[str, Any] = {}
+    if isinstance(transcription_json, dict):
+        source = transcription_json.get("source") if isinstance(transcription_json.get("source"), dict) else {}
+        transcription = (
+            transcription_json.get("transcription")
+            if isinstance(transcription_json.get("transcription"), dict)
+            else {}
+        )
+    duration_min = safe_float(transcription.get("duration_min_total"), None)
+    word_count = safe_int(transcription.get("word_count"))
+    generated_at = str(transcription_json.get("generated_at") or "").strip() if isinstance(transcription_json, dict) else ""
+    return {
+        "filename": filename,
+        "storage_backend": storage_backend or str(source.get("storage_backend") or "").strip(),
+        "source_path_audio": source_path_audio or str(source.get("source_path_audio") or source.get("ftp_path_audio") or "").strip(),
+        "created_datetime": created_datetime or generated_at,
+        "duration_min": (
+            f"{duration_min:.2f}".rstrip("0").rstrip(".")
+            if duration_min is not None
+            else ""
+        ),
+        "word_count": str(word_count) if word_count is not None else "",
+    }
+
+
+def render_call_view_html(
+    record: Dict[str, Any],
+    audio_url: str,
+) -> str:
+    meta = extract_call_view_meta(record)
+    transcript_text = extract_call_view_text(record) or "Текст транскрибации пока недоступен."
+    summary_text = extract_call_view_summary(record)
+    summary_html = ""
+    if summary_text:
+        summary_html = (
+            "<section class=\"panel\">"
+            "<h2>Краткий итог</h2>"
+            f"<pre>{html.escape(summary_text)}</pre>"
+            "</section>"
+        )
+    details = []
+    if meta["created_datetime"]:
+        details.append(f"<li><strong>Дата:</strong> {html.escape(meta['created_datetime'])}</li>")
+    if meta["duration_min"]:
+        details.append(f"<li><strong>Длительность, мин:</strong> {html.escape(meta['duration_min'])}</li>")
+    if meta["word_count"]:
+        details.append(f"<li><strong>Слов в диалоге:</strong> {html.escape(meta['word_count'])}</li>")
+    if meta["storage_backend"]:
+        details.append(f"<li><strong>Источник:</strong> {html.escape(meta['storage_backend'])}</li>")
+    details_html = "<ul class=\"meta\">" + "".join(details) + "</ul>" if details else ""
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Просмотр звонка - {html.escape(meta['filename'])}</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f4f6fb;
+      --card: #ffffff;
+      --line: #dfe5f1;
+      --text: #172033;
+      --muted: #5b6780;
+      --accent: #1463ff;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      background: linear-gradient(180deg, #eef3ff 0%, var(--bg) 100%);
+      color: var(--text);
+    }}
+    .wrap {{
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 24px 16px 40px;
+    }}
+    .hero {{
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 20px;
+      box-shadow: 0 10px 30px rgba(20, 40, 90, 0.08);
+    }}
+    h1, h2 {{ margin: 0 0 14px; }}
+    .subtitle {{
+      color: var(--muted);
+      margin: 8px 0 18px;
+      word-break: break-word;
+    }}
+    audio {{
+      width: 100%;
+      margin-top: 10px;
+    }}
+    .meta {{
+      margin: 18px 0 0;
+      padding-left: 18px;
+      color: var(--muted);
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+      margin-top: 18px;
+    }}
+    .panel {{
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 20px;
+      box-shadow: 0 10px 30px rgba(20, 40, 90, 0.06);
+    }}
+    pre {{
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font: 15px/1.55 Consolas, "Courier New", monospace;
+      color: var(--text);
+    }}
+    a {{
+      color: var(--accent);
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <h1>Просмотр звонка</h1>
+      <div class="subtitle">{html.escape(meta['filename'])}</div>
+      <audio controls preload="metadata" src="{html.escape(audio_url, quote=True)}"></audio>
+      {details_html}
+    </section>
+    <div class="grid">
+      {summary_html}
+      <section class="panel">
+        <h2>Транскрибация</h2>
+        <pre>{html.escape(transcript_text)}</pre>
+      </section>
+    </div>
+  </div>
+</body>
+</html>
+""".strip()
+
+
+def parse_audio_range_header(
+    range_header: str,
+    size_bytes: int,
+) -> Optional[Tuple[int, int]]:
+    raw = str(range_header or "").strip().lower()
+    if not raw.startswith("bytes="):
+        return None
+    value = raw[len("bytes="):]
+    start_raw, _, end_raw = value.partition("-")
+    if not start_raw and not end_raw:
+        return None
+    if start_raw:
+        if not start_raw.isdigit():
+            return None
+        start = int(start_raw)
+        end = int(end_raw) if end_raw.isdigit() else size_bytes - 1
+    else:
+        if not end_raw.isdigit():
+            return None
+        suffix = int(end_raw)
+        if suffix <= 0:
+            return None
+        start = max(size_bytes - suffix, 0)
+        end = size_bytes - 1
+    if start < 0 or end < start or start >= size_bytes:
+        return None
+    return start, min(end, size_bytes - 1)
+
+
+class CallViewerServer(ThreadingHTTPServer):
+    def __init__(
+        self,
+        server_address: Tuple[str, int],
+        request_handler_class: type[BaseHTTPRequestHandler],
+        cfg: Config,
+        db_store: DatabaseStore,
+    ) -> None:
+        self.cfg = cfg
+        self.db_store = db_store
+        super().__init__(server_address, request_handler_class)
+
+
+class CallViewerRequestHandler(BaseHTTPRequestHandler):
+    server: CallViewerServer
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        prefix = self.server.cfg.viewer_route_prefix
+        if path == prefix:
+            self._respond_not_found()
+            return
+        if path.endswith("/audio") and path.startswith(prefix + "/"):
+            token = path[len(prefix) + 1 : -len("/audio")]
+            self._handle_audio(token)
+            return
+        if path.startswith(prefix + "/"):
+            token = path[len(prefix) + 1 :]
+            self._handle_page(token)
+            return
+        self._respond_not_found()
+
+    def log_message(self, format: str, *args: Any) -> None:
+        logging.info("Viewer %s - %s", self.address_string(), format % args)
+
+    def _resolve_transcription_id(self, token: str) -> Optional[int]:
+        return parse_viewer_token(token, self.server.cfg.viewer_secret)
+
+    def _handle_page(self, token: str) -> None:
+        transcription_id = self._resolve_transcription_id(token)
+        if transcription_id is None:
+            self._respond_not_found()
+            return
+        try:
+            record = self.server.db_store.get_transcription_view_record(transcription_id)
+        except Exception:
+            logging.exception("Viewer could not load transcription %s", transcription_id)
+            self._respond_server_error()
+            return
+        if not isinstance(record, dict):
+            self._respond_not_found()
+            return
+        audio_url = f"{self.server.cfg.viewer_route_prefix}/{token}/audio"
+        html_body = render_call_view_html(record, audio_url)
+        payload = html_body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _handle_audio(self, token: str) -> None:
+        transcription_id = self._resolve_transcription_id(token)
+        if transcription_id is None:
+            self._respond_not_found()
+            return
+        try:
+            record = self.server.db_store.get_audio_blob_record(transcription_id)
+        except Exception:
+            logging.exception("Viewer could not load audio blob for transcription %s", transcription_id)
+            self._respond_server_error()
+            return
+        if not isinstance(record, dict):
+            self._respond_not_found()
+            return
+
+        audio_blob = record.get("audio_blob")
+        if not isinstance(audio_blob, (bytes, bytearray, memoryview)):
+            self._respond_not_found()
+            return
+        audio_bytes = bytes(audio_blob)
+        size_bytes = len(audio_bytes)
+        filename = str(record.get("filename_mp3") or "audio.bin").strip() or "audio.bin"
+        mime_type = str(record.get("mime_type") or "").strip() or guess_audio_mime_type(filename)
+        range_header = self.headers.get("Range", "")
+        selected_range = parse_audio_range_header(range_header, size_bytes)
+
+        if selected_range is None:
+            self.send_response(200)
+            self.send_header("Content-Type", mime_type)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(size_bytes))
+            self.end_headers()
+            self.wfile.write(audio_bytes)
+            return
+
+        start, end = selected_range
+        chunk = audio_bytes[start : end + 1]
+        self.send_response(206)
+        self.send_header("Content-Type", mime_type)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Range", f"bytes {start}-{end}/{size_bytes}")
+        self.send_header("Content-Length", str(len(chunk)))
+        self.end_headers()
+        self.wfile.write(chunk)
+
+    def _respond_not_found(self) -> None:
+        payload = b"Not found"
+        self.send_response(404)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _respond_server_error(self) -> None:
+        payload = b"Server error"
+        self.send_response(500)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+def start_viewer_server(
+    cfg: Config,
+    db_store: DatabaseStore,
+) -> Tuple[CallViewerServer, threading.Thread]:
+    server = CallViewerServer(
+        (cfg.viewer_host, cfg.viewer_port),
+        CallViewerRequestHandler,
+        cfg,
+        db_store,
+    )
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name="call-viewer-server",
+        daemon=True,
+    )
+    thread.start()
+    return server, thread
 
 
 def build_openai_http_client(
@@ -4599,7 +5106,15 @@ def process_remote_audio(
                 remote_audio_path,
             )
             logging.info("Sending Telegram message: %s", remote_audio_path)
-            telegram_results = send_telegram_message(cfg, reusable_telegram_message)
+            ready_telegram_message = build_ready_telegram_message(
+                cfg,
+                transcript_doc,
+                reusable_telegram_message,
+            )
+            analysis = transcript_doc.get("analysis")
+            if isinstance(analysis, dict):
+                analysis["telegram_message_rendered"] = ready_telegram_message
+            telegram_results = send_telegram_message(cfg, ready_telegram_message)
             transcript_doc["telegram"] = {
                 "sent": True,
                 "parts_sent": len(telegram_results),
@@ -4819,9 +5334,15 @@ def process_remote_audio(
             transcript_doc,
             cfg,
         )
+        rendered_telegram_message = build_ready_telegram_message(
+            cfg,
+            transcript_doc,
+            telegram_message,
+        )
         transcript_doc["analysis"] = {
             "model": cfg.analysis_model,
             "telegram_message": telegram_message,
+            "telegram_message_rendered": rendered_telegram_message,
             "generated_at": now_iso(),
         }
         transcript_doc["stage"] = "analyzed"
@@ -4835,7 +5356,7 @@ def process_remote_audio(
         )
 
         logging.info("Sending Telegram message: %s", remote_audio_path)
-        telegram_results = send_telegram_message(cfg, telegram_message)
+        telegram_results = send_telegram_message(cfg, rendered_telegram_message)
         transcript_doc["telegram"] = {
             "sent": True,
             "parts_sent": len(telegram_results),
@@ -5134,6 +5655,7 @@ def main() -> None:
     cfg = Config.from_env()
     db_store: Optional[DatabaseStore] = None
     openai_http_clients: List[httpx.Client] = []
+    viewer_server: Optional[CallViewerServer] = None
 
     cfg.work_root.mkdir(parents=True, exist_ok=True)
     ensure_parent_dir(cfg.state_path)
@@ -5165,6 +5687,10 @@ def main() -> None:
         raise RuntimeError("ffmpeg is required but was not found in PATH")
     if shutil.which("ffprobe") is None:
         raise RuntimeError("ffprobe is required but was not found in PATH")
+    if cfg.viewer_enabled and not cfg.db_enabled:
+        raise ValueError("VIEWER_ENABLED requires DB_ENABLED=1.")
+    if cfg.viewer_enabled and not cfg.viewer_secret:
+        raise ValueError("Set VIEWER_SECRET when VIEWER_ENABLED=1.")
     instruction_source = ensure_instruction_source_available(cfg, db_store)
     logging.info(
         "Instruction prompt mode: %s. Source: %s",
@@ -5218,9 +5744,34 @@ def main() -> None:
             "Yandex Disk source is enabled. Remote roots: %s",
             ", ".join(cfg.yandex_disk_remote_roots),
         )
+    if cfg.viewer_enabled:
+        logging.info(
+            "Viewer HTTP server is enabled on %s:%s%s",
+            cfg.viewer_host,
+            cfg.viewer_port,
+            cfg.viewer_route_prefix,
+        )
+        if cfg.viewer_public_base_url:
+            logging.info(
+                "Viewer public base URL is configured: %s",
+                cfg.viewer_public_base_url,
+            )
+        else:
+            logging.warning(
+                "VIEWER_ENABLED is on, but VIEWER_PUBLIC_BASE_URL is empty. "
+                "Viewer pages will work locally, but Telegram links will not be added."
+            )
     try:
         client, openai_http_clients = build_openai_clients(cfg)
         state = load_state(cfg.state_path)
+        if cfg.viewer_enabled and db_store is not None:
+            viewer_server, _ = start_viewer_server(cfg, db_store)
+            logging.info(
+                "Viewer server started on %s:%s%s",
+                cfg.viewer_host,
+                cfg.viewer_port,
+                cfg.viewer_route_prefix,
+            )
 
         logging.info(
             "Daemon started. Poll interval: %s sec. Sources: ftp=%s, yandex_disk=%s",
@@ -5237,6 +5788,9 @@ def main() -> None:
                 logging.exception("Cycle crashed")
             time.sleep(cfg.poll_interval_sec)
     finally:
+        if viewer_server is not None:
+            viewer_server.shutdown()
+            viewer_server.server_close()
         if db_store is not None:
             db_store.close()
         for http_client in openai_http_clients:

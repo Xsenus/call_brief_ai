@@ -73,6 +73,12 @@ def make_config(**overrides):
         "telegram_chat_id": "-1001",
         "telegram_message_thread_id": None,
         "telegram_proxy": "",
+        "viewer_enabled": False,
+        "viewer_host": "127.0.0.1",
+        "viewer_port": 8080,
+        "viewer_route_prefix": "/audio/analysis",
+        "viewer_public_base_url": "",
+        "viewer_secret": "",
         "poll_interval_sec": 60,
         "min_stable_polls": 2,
         "min_audio_bytes": 102400,
@@ -166,6 +172,90 @@ class InspectResponseOutputTests(unittest.TestCase):
         )
 
         self.assertEqual(message, "")
+
+    def test_extract_saved_telegram_message_prefers_rendered_variant(self):
+        transcript_doc = {
+            "source": {"ftp_path_audio": "/recordings/call.mp3"},
+            "analysis": {
+                "telegram_message": "base message",
+                "telegram_message_rendered": "rendered message",
+            },
+            "telegram": {"sent": False},
+        }
+
+        message = daemon.extract_saved_telegram_message(
+            transcript_doc,
+            "/recordings/call.mp3",
+        )
+
+        self.assertEqual(message, "rendered message")
+
+
+class ViewerLinkTests(unittest.TestCase):
+    def test_build_public_view_url_uses_signed_token(self):
+        cfg = make_config(
+            viewer_public_base_url="https://calls.example.com",
+            viewer_route_prefix="/audio/analysis",
+            viewer_secret="secret",
+        )
+        transcript_doc = {"storage": {"db": {"transcription_id": 42}}}
+
+        url = daemon.build_public_view_url(cfg, transcript_doc)
+
+        self.assertTrue(url.startswith("https://calls.example.com/audio/analysis/42."))
+        token = url.rsplit("/", 1)[-1]
+        self.assertEqual(daemon.parse_viewer_token(token, "secret"), 42)
+
+    def test_build_ready_telegram_message_prepends_single_view_link(self):
+        cfg = make_config(
+            viewer_public_base_url="https://calls.example.com",
+            viewer_route_prefix="/audio/analysis",
+            viewer_secret="secret",
+        )
+        transcript_doc = {"storage": {"db": {"transcription_id": 11}}}
+
+        text = daemon.build_ready_telegram_message(
+            cfg,
+            transcript_doc,
+            "Основной текст сообщения",
+        )
+
+        self.assertIn("Аудио-запись и текст звонка:", text)
+        self.assertIn("Основной текст сообщения", text)
+        self.assertEqual(text.count("Аудио-запись и текст звонка:"), 1)
+
+    def test_parse_audio_range_header_supports_explicit_range(self):
+        selected = daemon.parse_audio_range_header("bytes=10-19", 100)
+        self.assertEqual(selected, (10, 19))
+
+    def test_parse_audio_range_header_supports_suffix_range(self):
+        selected = daemon.parse_audio_range_header("bytes=-20", 100)
+        self.assertEqual(selected, (80, 99))
+
+    def test_render_call_view_html_contains_audio_and_transcript(self):
+        record = {
+            "filename_mp3": "call.mp3",
+            "created_datetime": "2026-04-06T00:00:00+00:00",
+            "transcription_json": {
+                "generated_at": "2026-04-06T00:00:00+00:00",
+                "transcription": {
+                    "dialogue_text": "Клиент: Добрый день",
+                    "duration_min_total": 1.6,
+                    "word_count": 3,
+                },
+            },
+            "analysis_json": {
+                "analysis": {
+                    "telegram_message": "Краткий итог звонка"
+                }
+            },
+        }
+
+        html_text = daemon.render_call_view_html(record, "/audio/analysis/token/audio")
+
+        self.assertIn("/audio/analysis/token/audio", html_text)
+        self.assertIn("Клиент: Добрый день", html_text)
+        self.assertIn("Краткий итог звонка", html_text)
 
 
 class InstructionLoadingTests(unittest.TestCase):
