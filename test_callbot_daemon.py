@@ -232,6 +232,104 @@ class InstructionLoadingTests(unittest.TestCase):
 
         self.assertEqual(text, "Use this exact prompt.")
 
+    def test_resolve_instruction_text_prefers_database_payload(self):
+        cfg = make_config(
+            instruction_json_path=Path("missing-instructions.json"),
+            instruction_prompt_mode="rendered",
+        )
+        db_store = daemon.DatabaseStore(cfg=cfg)
+
+        with (
+            mock.patch.object(
+                db_store,
+                "get_instruction_payload",
+                return_value={"instructions": "Instruction from DB"},
+            ) as mocked_get,
+            mock.patch.object(
+                db_store,
+                "bootstrap_instruction_payload_from_file",
+            ) as mocked_bootstrap,
+        ):
+            text = daemon.resolve_instruction_text(cfg, db_store)
+
+        self.assertEqual(text, "Instruction from DB")
+        mocked_get.assert_called_once_with()
+        mocked_bootstrap.assert_not_called()
+
+    def test_resolve_instruction_text_bootstraps_database_from_file_when_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "instructions.json"
+            path.write_text(
+                json.dumps({"instructions": "Instruction from file"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            cfg = make_config(
+                instruction_json_path=path,
+                instruction_prompt_mode="raw",
+            )
+            db_store = daemon.DatabaseStore(cfg=cfg)
+
+            with (
+                mock.patch.object(
+                    db_store,
+                    "get_instruction_payload",
+                    return_value=None,
+                ) as mocked_get,
+                mock.patch.object(
+                    db_store,
+                    "bootstrap_instruction_payload_from_file",
+                    return_value=({"instructions": "Instruction from file"}, True),
+                ) as mocked_bootstrap,
+            ):
+                text = daemon.resolve_instruction_text(cfg, db_store)
+
+        self.assertEqual(text, "Instruction from file")
+        mocked_get.assert_called_once_with()
+        mocked_bootstrap.assert_called_once_with(path)
+
+    def test_resolve_instruction_text_falls_back_to_file_when_db_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "instructions.json"
+            path.write_text(
+                json.dumps({"instructions": "Instruction from file"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            cfg = make_config(
+                instruction_json_path=path,
+                instruction_prompt_mode="raw",
+            )
+            db_store = daemon.DatabaseStore(cfg=cfg)
+
+            with mock.patch.object(
+                db_store,
+                "get_instruction_payload",
+                side_effect=RuntimeError("db down"),
+            ):
+                text = daemon.resolve_instruction_text(cfg, db_store)
+
+        self.assertEqual(text, "Instruction from file")
+
+    def test_ensure_instruction_source_available_accepts_database_without_file(self):
+        cfg = make_config(instruction_json_path=Path("missing-instructions.json"))
+        db_store = daemon.DatabaseStore(cfg=cfg)
+
+        with (
+            mock.patch.object(
+                db_store,
+                "get_instruction_payload",
+                return_value={"instructions": "Instruction from DB"},
+            ) as mocked_get,
+            mock.patch.object(
+                db_store,
+                "bootstrap_instruction_payload_from_file",
+            ) as mocked_bootstrap,
+        ):
+            source = daemon.ensure_instruction_source_available(cfg, db_store)
+
+        self.assertEqual(source, "database")
+        mocked_get.assert_called_once_with()
+        mocked_bootstrap.assert_not_called()
+
 
 class AnalysisRetryTests(unittest.TestCase):
     def test_builds_retry_settings_for_token_exhaustion(self):
@@ -607,6 +705,22 @@ class DatabaseStoreTests(unittest.TestCase):
         self.assertTrue(mocked_connect.call_args.kwargs["autocommit"])
         self.assertEqual(admin_cursor.execute.call_count, 2)
         self.assertIn("CREATE DATABASE", str(admin_cursor.execute.call_args_list[1].args[0]))
+
+    def test_initialize_creates_instruction_table_and_trigger(self):
+        cfg = make_config()
+        db_store = daemon.DatabaseStore(cfg=cfg)
+        connect_cm = mock.MagicMock()
+        connection = mock.MagicMock()
+        connect_cm.__enter__.return_value = connection
+        cursor = connection.cursor.return_value.__enter__.return_value
+
+        with mock.patch.object(db_store, "_connect", return_value=connect_cm):
+            db_store.initialize()
+
+        executed_sql = "\n".join(str(call.args[0]) for call in cursor.execute.call_args_list)
+        self.assertIn(daemon.DB_INSTRUCTION_TABLE, executed_sql)
+        self.assertIn("CREATE OR REPLACE FUNCTION", executed_sql)
+        self.assertIn(daemon.DB_INSTRUCTION_UPDATED_TRIGGER, executed_sql)
 
     def test_sync_transcript_doc_to_db_updates_storage_ids(self):
         cfg = make_config()

@@ -71,6 +71,10 @@ MAX_ANALYSIS_RETRY_MAX_OUTPUT_TOKENS = 6000
 DB_TRANSCRIPTION_TABLE = "ai_cell_trans"
 DB_ANALYSIS_TABLE = "ai_cell_analisys"
 DB_AUDIO_BLOB_TABLE = "ai_cell_audio_blob"
+DB_INSTRUCTION_TABLE = "ai_instruction_config"
+DB_INSTRUCTION_DEFAULT_CODE = "default"
+DB_SET_UPDATED_AT_FUNCTION = "set_updated_datetime"
+DB_INSTRUCTION_UPDATED_TRIGGER = "trg_ai_instruction_config_set_updated_datetime"
 T = TypeVar("T")
 
 
@@ -1184,6 +1188,17 @@ class DatabaseStore:
             with connection.cursor() as cur:
                 cur.execute(
                     f"""
+                    CREATE OR REPLACE FUNCTION {DB_SET_UPDATED_AT_FUNCTION}()
+                    RETURNS TRIGGER AS $$
+                    BEGIN
+                        NEW.updated_datetime = NOW();
+                        RETURN NEW;
+                    END;
+                    $$ LANGUAGE plpgsql
+                    """
+                )
+                cur.execute(
+                    f"""
                     CREATE TABLE IF NOT EXISTS {DB_TRANSCRIPTION_TABLE} (
                         id BIGSERIAL PRIMARY KEY,
                         created_datetime TIMESTAMPTZ NOT NULL,
@@ -1237,6 +1252,29 @@ class DatabaseStore:
                 )
                 cur.execute(
                     f"""
+                    CREATE TABLE IF NOT EXISTS {DB_INSTRUCTION_TABLE} (
+                        code TEXT PRIMARY KEY,
+                        instruction_json JSONB NOT NULL,
+                        updated_datetime TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    f"""
+                    DROP TRIGGER IF EXISTS {DB_INSTRUCTION_UPDATED_TRIGGER}
+                    ON {DB_INSTRUCTION_TABLE}
+                    """
+                )
+                cur.execute(
+                    f"""
+                    CREATE TRIGGER {DB_INSTRUCTION_UPDATED_TRIGGER}
+                    BEFORE UPDATE ON {DB_INSTRUCTION_TABLE}
+                    FOR EACH ROW
+                    EXECUTE FUNCTION {DB_SET_UPDATED_AT_FUNCTION}()
+                    """
+                )
+                cur.execute(
+                    f"""
                     CREATE INDEX IF NOT EXISTS idx_{DB_TRANSCRIPTION_TABLE}_filename_mp3
                     ON {DB_TRANSCRIPTION_TABLE}(filename_mp3)
                     """
@@ -1247,6 +1285,59 @@ class DatabaseStore:
                     ON {DB_AUDIO_BLOB_TABLE}(filename_mp3)
                     """
                 )
+
+    def get_instruction_payload(
+        self,
+        code: str = DB_INSTRUCTION_DEFAULT_CODE,
+    ) -> Optional[Any]:
+        with self._connect() as connection:
+            with connection.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT instruction_json
+                    FROM {DB_INSTRUCTION_TABLE}
+                    WHERE code = %s
+                    """,
+                    (code,),
+                )
+                row = cur.fetchone()
+        if row is None:
+            return None
+        return row.get("instruction_json")
+
+    def bootstrap_instruction_payload_from_file(
+        self,
+        path: Path,
+        code: str = DB_INSTRUCTION_DEFAULT_CODE,
+    ) -> Tuple[Optional[Any], bool]:
+        if not path.exists():
+            return None, False
+
+        payload = load_instruction_json_payload(path)
+        if payload is None:
+            return None, False
+
+        with self._connect() as connection:
+            with connection.cursor() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO {DB_INSTRUCTION_TABLE} (
+                        code,
+                        instruction_json
+                    )
+                    VALUES (%s, %s::jsonb)
+                    ON CONFLICT (code) DO NOTHING
+                    RETURNING instruction_json
+                    """,
+                    (
+                        code,
+                        json.dumps(payload, ensure_ascii=False),
+                    ),
+                )
+                row = cur.fetchone()
+        if row is not None:
+            return row.get("instruction_json"), True
+        return self.get_instruction_payload(code), False
 
     def _save_transcription(
         self,
@@ -2068,19 +2159,98 @@ def render_instruction_object(obj: Dict[str, Any]) -> str:
     return "\n\n".join(section for section in sections if section.strip()).strip()
 
 
-def load_instruction_text(path: Path, prompt_mode: str = "raw") -> str:
-    raw = path.read_text(encoding="utf-8")
+def try_parse_json_value(raw: str) -> Tuple[bool, Any]:
     try:
-        obj = json.loads(raw)
+        return True, json.loads(raw)
     except json.JSONDecodeError:
-        return raw.strip()
+        return False, raw.strip()
 
-    if prompt_mode == "rendered" and isinstance(obj, dict):
-        return render_instruction_object(obj)
-    direct_text = extract_direct_instruction_text(obj)
+
+def render_instruction_payload(payload: Any, prompt_mode: str = "raw") -> str:
+    if prompt_mode == "rendered" and isinstance(payload, dict):
+        return render_instruction_object(payload)
+    direct_text = extract_direct_instruction_text(payload)
     if direct_text:
         return direct_text
-    return raw.strip()
+    if isinstance(payload, str):
+        return payload.strip()
+    return json.dumps(payload, ensure_ascii=False, indent=2).strip()
+
+
+def load_instruction_json_payload(path: Path) -> Optional[Any]:
+    raw = path.read_text(encoding="utf-8")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        logging.warning(
+            "Instruction bootstrap from PostgreSQL skipped because the file is not valid JSON: %s",
+            path,
+        )
+        return None
+
+
+def load_instruction_text(path: Path, prompt_mode: str = "raw") -> str:
+    raw = path.read_text(encoding="utf-8")
+    is_json, payload = try_parse_json_value(raw)
+    if not is_json:
+        return str(payload).strip()
+    return render_instruction_payload(payload, prompt_mode)
+
+
+def resolve_instruction_text(
+    cfg: Config,
+    db_store: Optional[DatabaseStore] = None,
+) -> str:
+    if isinstance(db_store, DatabaseStore):
+        try:
+            payload = db_store.get_instruction_payload()
+            if payload is None:
+                payload, bootstrapped = db_store.bootstrap_instruction_payload_from_file(
+                    cfg.instruction_json_path
+                )
+                if bootstrapped:
+                    logging.info(
+                        "Bootstrapped instruction config into PostgreSQL table '%s' from %s.",
+                        DB_INSTRUCTION_TABLE,
+                        cfg.instruction_json_path,
+                    )
+            if payload is not None:
+                return render_instruction_payload(payload, cfg.instruction_prompt_mode)
+        except Exception:
+            logging.exception(
+                "Could not load instruction config from PostgreSQL; falling back to file."
+            )
+    return load_instruction_text(cfg.instruction_json_path, cfg.instruction_prompt_mode)
+
+
+def ensure_instruction_source_available(
+    cfg: Config,
+    db_store: Optional[DatabaseStore] = None,
+) -> str:
+    if isinstance(db_store, DatabaseStore):
+        try:
+            payload = db_store.get_instruction_payload()
+            if payload is None:
+                payload, bootstrapped = db_store.bootstrap_instruction_payload_from_file(
+                    cfg.instruction_json_path
+                )
+                if bootstrapped:
+                    logging.info(
+                        "Created default instruction config in PostgreSQL table '%s' from %s.",
+                        DB_INSTRUCTION_TABLE,
+                        cfg.instruction_json_path,
+                    )
+            if payload is not None:
+                return "database"
+        except Exception:
+            logging.exception(
+                "Could not prepare instruction config from PostgreSQL; falling back to file."
+            )
+    if cfg.instruction_json_path.exists():
+        return "file"
+    raise FileNotFoundError(
+        f"instructions file not found: {cfg.instruction_json_path}"
+    )
 
 
 def parse_json_text(raw: str, source_name: str) -> Optional[Dict[str, Any]]:
@@ -4859,9 +5029,9 @@ def scan_cycle(
     state: Dict[str, Any],
     db_store: Optional[DatabaseStore] = None,
 ) -> None:
-    instruction_text = load_instruction_text(
-        cfg.instruction_json_path,
-        cfg.instruction_prompt_mode,
+    instruction_text = resolve_instruction_text(
+        cfg,
+        db_store if isinstance(db_store, DatabaseStore) else None,
     )
     try:
         all_files = remote_walk(cfg)
@@ -4995,14 +5165,15 @@ def main() -> None:
         raise RuntimeError("ffmpeg is required but was not found in PATH")
     if shutil.which("ffprobe") is None:
         raise RuntimeError("ffprobe is required but was not found in PATH")
-    if not cfg.instruction_json_path.exists():
-        raise FileNotFoundError(
-            f"instructions file not found: {cfg.instruction_json_path}"
-        )
+    instruction_source = ensure_instruction_source_available(cfg, db_store)
     logging.info(
         "Instruction prompt mode: %s. Source: %s",
         cfg.instruction_prompt_mode,
-        cfg.instruction_json_path,
+        (
+            f"PostgreSQL table {DB_INSTRUCTION_TABLE} (code={DB_INSTRUCTION_DEFAULT_CODE})"
+            if instruction_source == "database"
+            else str(cfg.instruction_json_path)
+        ),
     )
 
     if cfg.openai_base_url:
