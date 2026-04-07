@@ -128,6 +128,11 @@ MIN_STABLE_POLLS=1
 
 Важно: теперь в PostgreSQL хранится и сам исходный аудиофайл в отдельной таблице `ai_cell_audio_blob`. При этом файл по-прежнему остается в исходном хранилище `FTP/SFTP/Яндекс Диск`, если это разрешено настройками архивации/удаления.
 
+Дополнительно в PostgreSQL используются:
+
+- `ai_instruction_config` — актуальная инструкция для анализа, если она хранится в БД, а не только в `instructions.json`
+- `missed_calls` — отдельная таблица для webhook-сервиса MANGO с пропущенными входящими звонками, статусом доставки в Telegram и полным `raw_payload`
+
 ## Как заново обработать один звонок
 
 Чтобы принудительно перегнать конкретный файл, нужно удалить оба следа:
@@ -140,13 +145,52 @@ MIN_STABLE_POLLS=1
 ## Файлы проекта
 
 - `callbot_daemon.py` — основной daemon
+- `mango_webhook_server.py` — отдельный webhook-сервис для MANGO OFFICE missed inbound calls
 - `get_telegram_chat_id.py` — helper для получения `TELEGRAM_CHAT_ID`
 - `.env.example` — рабочий шаблон конфигурации
 - `instruction.json` и `instructions.json` — примеры системной инструкции
 - `callbot.service.example` — шаблон systemd unit для ручной установки
 - `deploy/callbot.service` — unit для auto-deploy на VPS
+- `deploy/mango-webhook.service` — unit для отдельного MANGO webhook-сервиса
+- `deploy/mango_webhook.nginx.conf.example` — пример nginx proxy для `POST /events/summary`
 - `deploy/remote_deploy.sh` — удаленный deploy-скрипт
+- `test_mango_webhook_server.py` — тесты отдельного MANGO webhook-сервиса
 - `.github/workflows/deploy.yml` — GitHub Actions workflow
+
+## MANGO webhook пропущенных звонков
+
+В репозитории есть отдельная локальная реализация webhook-сервиса для MANGO OFFICE: `mango_webhook_server.py`.
+
+Он не заменяет основной `callbot_daemon.py`, а работает рядом с ним как отдельный процесс:
+
+- принимает `POST /events/summary`
+- проверяет `sign`
+- фильтрует только пропущенные входящие звонки
+- пишет событие в PostgreSQL таблицу `missed_calls`
+- не допускает дублей по `entry_id`
+- отправляет сообщение в Telegram
+- при временной ошибке Telegram оставляет запись в БД и повторяет отправку через background retry worker
+
+Базовые переменные окружения для него уже добавлены в `.env.example`:
+
+- `MANGO_ENABLED`
+- `MANGO_HTTP_HOST`
+- `MANGO_HTTP_PORT`
+- `MANGO_WEBHOOK_PATH`
+- `MANGO_API_KEY`
+- `MANGO_API_SALT`
+- `MANGO_ALLOWED_IPS`
+- `MANGO_DISPLAY_TIMEZONE`
+- `MANGO_RETRY_ENABLED`
+- `MANGO_RETRY_INTERVAL_SEC`
+- `MANGO_RETRY_BATCH_SIZE`
+- `MANGO_LOG_PAYLOADS`
+
+Важно:
+
+- эта реализация уже готова локально и покрыта тестами
+- в production она пока не включена автоматически
+- для боевого запуска дополнительно нужны HTTPS endpoint, allowlist IP MANGO, реальные `MANGO_API_KEY` / `MANGO_API_SALT` и установка `mango-webhook.service`
 
 ## Быстрый старт на VPS
 
@@ -674,5 +718,7 @@ Workflow:
 - workflow обновляет код и релиз, но рабочий `instructions.json` обычно читается из `/opt/call_brief_ai/shared/instructions.json`
 - если этот файл на VPS уже существует и не пустой, deploy не перезаписывает его автоматически
 - поэтому изменение `instructions.json` в git не гарантирует автоматическое обновление боевого prompt на сервере без отдельного обновления файла в `shared`
+- текущий auto-deploy workflow пока управляет только `callbot.service`
+- если включать MANGO webhook в production, `mango-webhook.service` и nginx-маршрут под него нужно будет добавить и проверить отдельно
 
 Подробный пошаговый гайд лежит в [DEPLOYMENT.md](DEPLOYMENT.md).

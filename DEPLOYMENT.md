@@ -145,6 +145,20 @@ TELEGRAM_MESSAGE_THREAD_ID=
 TELEGRAM_PROXY=
 TELEGRAM_DROP_WEBHOOK=0
 
+# Optional: separate MANGO webhook service for missed inbound calls
+MANGO_ENABLED=0
+MANGO_HTTP_HOST=127.0.0.1
+MANGO_HTTP_PORT=8081
+MANGO_WEBHOOK_PATH=/events/summary
+MANGO_API_KEY=
+MANGO_API_SALT=
+MANGO_ALLOWED_IPS=
+MANGO_DISPLAY_TIMEZONE=Asia/Novosibirsk
+MANGO_RETRY_ENABLED=1
+MANGO_RETRY_INTERVAL_SEC=60
+MANGO_RETRY_BATCH_SIZE=20
+MANGO_LOG_PAYLOADS=0
+
 POLL_INTERVAL_SEC=60
 MIN_STABLE_POLLS=2
 MIN_AUDIO_BYTES=102400
@@ -184,6 +198,8 @@ FTP_ARCHIVE_DIR=/recordings/archive
 FTP_MOVE_TO_ARCHIVE_AFTER_SUCCESS=0
 FTP_DELETE_AFTER_SUCCESS=0
 ```
+
+Блок `MANGO_*` нужен только для отдельного webhook-сервиса пропущенных звонков. Его можно оставить выключенным, пока этот контур не выкатывается в production.
 
 ## 3. Подготовьте `instructions.json`
 
@@ -316,6 +332,13 @@ Workflow из `.github/workflows/deploy.yml`:
 
 Важно: production-сервис читает `.env` и `instructions.json` из каталога `shared`. Если `/opt/call_brief_ai/shared/instructions.json` уже существует и не пустой, deploy не заменяет его автоматически файлом из нового релиза. То есть push в `main` обновляет код и перезапускает сервис, но не обязательно обновляет боевой prompt.
 
+Дополнительно:
+
+- локальная реализация `mango_webhook_server.py` уже есть в репозитории
+- `deploy/mango-webhook.service` и `deploy/mango_webhook.nginx.conf.example` тоже уже подготовлены
+- текущий GitHub Actions workflow пока не устанавливает и не перезапускает `mango-webhook.service`
+- при включении MANGO в production этот шаг нужно делать отдельно или расширить workflow
+
 ## 9. Сколько релизов хранится
 
 По умолчанию workflow хранит 3 последних релиза.
@@ -370,6 +393,14 @@ ls -lah /opt/call_brief_ai/releases
 
 ```bash
 sed -n '1,200p' /opt/call_brief_ai/shared/.env
+```
+
+Если дополнительно включаете MANGO webhook, проверьте еще:
+
+```bash
+systemctl status mango-webhook.service --no-pager
+journalctl -u mango-webhook.service -n 200 --no-pager
+curl -i http://127.0.0.1:8081/healthz
 ```
 
 ## 11. Обновление `.env`
@@ -473,3 +504,28 @@ systemctl stop callbot.service
 ```bash
 systemctl start callbot.service
 ```
+
+### Отдельный MANGO webhook-сервис
+
+Если включаете webhook пропущенных звонков из MANGO, рядом с основным daemon нужен второй systemd unit:
+
+```bash
+cp /opt/call_brief_ai/current/deploy/mango-webhook.service /etc/systemd/system/mango-webhook.service
+systemctl daemon-reload
+systemctl enable mango-webhook.service
+systemctl restart mango-webhook.service
+systemctl status mango-webhook.service --no-pager
+```
+
+Для nginx используйте шаблон:
+
+```text
+/opt/call_brief_ai/current/deploy/mango_webhook.nginx.conf.example
+```
+
+Перед включением в production нужно обязательно:
+
+- заполнить `MANGO_API_KEY` и `MANGO_API_SALT` в `/opt/call_brief_ai/shared/.env`
+- настроить allowlist IP MANGO
+- опубликовать HTTPS endpoint для `POST /events/summary`
+- только после этого регистрировать webhook URL в кабинете MANGO

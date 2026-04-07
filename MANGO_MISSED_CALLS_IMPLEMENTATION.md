@@ -1,5 +1,36 @@
 # Реализация MANGO webhook для уведомлений о пропущенных звонках
 
+## Текущий статус
+
+На текущий момент в репозитории уже есть локальная реализация этого контура:
+
+- `mango_webhook_server.py`
+- `test_mango_webhook_server.py`
+- `deploy/mango-webhook.service`
+- `deploy/mango_webhook.nginx.conf.example`
+- блок `MANGO_*` в `.env.example`
+
+Что уже реализовано локально:
+
+- отдельный `ThreadingHTTPServer` для `POST /events/summary`
+- проверка `sign` по формуле `sha256(api_key + json + api_salt)`
+- allowlist IP через `MANGO_ALLOWED_IPS`
+- запись пропущенных входящих звонков в таблицу `missed_calls`
+- защита от дублей по `entry_id`
+- отправка сообщения в Telegram
+- сохранение `telegram_message_id`
+- пометка failed state при ошибке Telegram
+- background retry worker для повторной отправки
+- unit/integration-like тесты и локальный HTTP smoke test
+
+Что еще не сделано:
+
+- production-выкладка на VPS
+- включение отдельного `mango-webhook.service`
+- nginx/HTTPS-публикация webhook endpoint на бою
+- заполнение реальных `MANGO_API_KEY`, `MANGO_API_SALT` и allowlist IP
+- проверка на реальном payload от MANGO в production
+
 ## Цель
 
 Доработать проект так, чтобы он принимал webhook `POST /events/summary` от MANGO OFFICE и отправлял уведомление в Telegram-группу только по пропущенным входящим звонкам.
@@ -20,13 +51,12 @@
 - `systemd`-запуск production daemon;
 - общий `.env`-подход и логирование.
 
-Чего сейчас нет:
+Чего сейчас еще нет именно в production:
 
-- входящего HTTP webhook-сервера;
-- HTTPS endpoint под MANGO;
-- отдельной таблицы `missed_calls`;
-- логики проверки `sign` для MANGO Realtime API;
-- механизма ретрая для неотправленных Telegram-уведомлений по missed calls.
+- опубликованного HTTPS endpoint под MANGO;
+- включенного `mango-webhook.service` на VPS;
+- подтвержденного боевого allowlist IP от MANGO;
+- верификации на реальном production payload.
 
 ## Степень готовности проекта относительно ТЗ
 
@@ -39,12 +69,11 @@
 
 ### Нужно реализовать с нуля
 
-- отдельный HTTP listener под входящие webhook-запросы;
-- проверку подписи MANGO;
-- таблицу `missed_calls`;
-- дедупликацию именно по `entry_id` из MANGO;
-- retry-контур для неуспешной доставки в Telegram;
-- документацию по HTTPS/Nginx/allowlist.
+- production deployment отдельного HTTP listener;
+- публикацию endpoint через HTTPS;
+- боевую настройку allowlist IP;
+- финальную сверку парсера на реальном MANGO payload;
+- rollout и post-deploy проверку.
 
 ### Вне кода, но обязательно для работоспособности
 
