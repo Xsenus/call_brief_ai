@@ -1,0 +1,17 @@
+[Unit]
+Description=Call Brief AI MANGO webhook
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=callbot
+Group=callbot
+WorkingDirectory=/opt/call_brief_ai/current
+EnvironmentFile=/opt/call_brief_ai/shared/.env
+ExecStart=/opt/call_brief_ai/current/.venv/bin/python /opt/call_brief_ai/current/mango_webhook_server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
